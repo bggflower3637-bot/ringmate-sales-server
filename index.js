@@ -245,7 +245,7 @@ function buildAssistantResponse(message, endCall = false) {
    * 아래는 범용적으로 쓰기 쉬운 단순 응답 예시다.
    */
   return {
-    message,
+    response: message,
     endCall
   };
 }
