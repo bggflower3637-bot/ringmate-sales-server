@@ -1,14 +1,13 @@
 {
   "name": "ringmate-sales-server",
   "version": "1.0.0",
-  "description": "Ringmate Sales AI Server",
-  "main": "index.js",
+  "description": "Ringmate Sales AI webhook server",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "body-parser": "^1.20.2",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
   }
 }
