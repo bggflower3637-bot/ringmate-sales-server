@@ -9,11 +9,10 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 
-// 간단한 턴 저장 (임시)
 const calls = new Map();
 
 // ===============================
-// 1️⃣ 첫 진입 (인사)
+// 1️⃣ 첫 진입
 // ===============================
 app.post("/voice/incoming", (req, res) => {
   const callSid = req.body.CallSid;
@@ -23,11 +22,17 @@ app.post("/voice/incoming", (req, res) => {
   res.type("text/xml");
   res.send(`
     <Response>
-      <Gather input="speech" action="/voice/process" method="POST">
-        <Say>
-          Hi, quick question. Are you currently handling your calls manually?
-        </Say>
+      <Gather 
+        input="speech"
+        action="/voice/process"
+        method="POST"
+        speechTimeout="auto"
+        timeout="2"
+      >
+        <Say>Hi—quick question. Do you handle calls yourself?</Say>
       </Gather>
+      <Say>Sorry, I didn’t catch that.</Say>
+      <Redirect>/voice/process</Redirect>
     </Response>
   `);
 });
@@ -39,7 +44,9 @@ app.post("/voice/process", (req, res) => {
   const callSid = req.body.CallSid;
   const userSpeech = req.body.SpeechResult || "";
 
-  const call = calls.get(callSid) || { turn: 0 };
+  let call = calls.get(callSid);
+  if (!call) call = { turn: 0 };
+
   call.turn += 1;
   calls.set(callSid, call);
 
@@ -47,21 +54,29 @@ app.post("/voice/process", (req, res) => {
 
   let responseText = "";
 
-  // 🔥 핵심: 턴 기반 흐름
+  // 🔥 짧고 자연스럽게
   if (call.turn === 1) {
-    responseText = "Got it, that makes sense. Do you ever miss calls when things get busy?";
+    responseText = "Got it. Do you miss calls when it gets busy?";
   } else if (call.turn === 2) {
-    responseText = "Yeah, that happens a lot. Would you be open to something that helps with that?";
+    responseText = "Yeah, that happens. Would that be helpful?";
   } else {
-    responseText = "Got it, no worries. Have a great day!";
+    responseText = "Got it. Have a great day!";
   }
 
   res.type("text/xml");
   res.send(`
     <Response>
-      <Gather input="speech" action="/voice/process" method="POST">
+      <Gather 
+        input="speech"
+        action="/voice/process"
+        method="POST"
+        speechTimeout="auto"
+        timeout="2"
+      >
         <Say>${responseText}</Say>
       </Gather>
+      <Say>Sorry, I didn’t catch that.</Say>
+      <Redirect>/voice/process</Redirect>
     </Response>
   `);
 });
@@ -72,5 +87,5 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log("Server running on port " + PORT);
 });
