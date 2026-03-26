@@ -14,8 +14,8 @@ app.use("/audio", express.static(path.join(__dirname, "audio")));
 
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || "https://ringmate-sales-server.onrender.com";
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;sk_09da12034bba8b68a5bfb68a5c3ddcee4074ba5d799f5f41
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;qSeXEcewz7tA0Q0qk9fH
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
 // 아주 임시 저장
 const calls = new Map();
