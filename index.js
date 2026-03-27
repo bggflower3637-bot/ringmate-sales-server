@@ -35,9 +35,9 @@ async function generateSpeech(text) {
       text,
       model_id: "eleven_turbo_v2",
       voice_settings: {
-        stability: 0.35,
-        similarity_boost: 0.85,
-        style: 0.18,
+        stability: 0.4,
+        similarity_boost: 0.8,
+        style: 0.08,
         use_speaker_boost: true,
       },
     },
@@ -66,7 +66,7 @@ async function createSingleAudioUrl(text) {
 }
 
 // -----------------------------
-// Call flow helpers
+// Call flow
 // -----------------------------
 function getNextStep(currentStep) {
   if (currentStep === "intro") return "problem-check";
@@ -98,88 +98,174 @@ function buildHangupTwiml(audioUrl) {
 }
 
 // -----------------------------
-// OpenAI reply generator
+// Lightweight intent + reaction
 // -----------------------------
-async function generateReply(step, userText = "") {
+function detectIntent(text = "") {
+  const t = text.toLowerCase();
+
+  if (!t.trim()) return "empty";
+
+  if (
+    t.includes("not interested") ||
+    t.includes("no thanks") ||
+    t.includes("we're good") ||
+    t.includes("we are good") ||
+    t.includes("don't need") ||
+    t.includes("do not need") ||
+    t.includes("nope")
+  ) {
+    return "negative";
+  }
+
+  if (
+    t.includes("sometimes") ||
+    t.includes("busy") ||
+    t.includes("miss calls") ||
+    t.includes("missed calls") ||
+    t.includes("too many calls") ||
+    t.includes("can't answer") ||
+    t.includes("cannot answer") ||
+    t.includes("hard to keep up")
+  ) {
+    return "pain";
+  }
+
+  if (
+    t.includes("yeah") ||
+    t.includes("yes") ||
+    t.includes("sure") ||
+    t.includes("okay") ||
+    t.includes("ok") ||
+    t.includes("maybe") ||
+    t.includes("possibly")
+  ) {
+    return "positive";
+  }
+
+  if (
+    t.includes("haha") ||
+    t.includes("lol") ||
+    t.includes("funny")
+  ) {
+    return "light";
+  }
+
+  return "neutral";
+}
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function getReaction(intent, step) {
+  const reactions = {
+    intro: {
+      positive: ["Got it.", "Okay.", "Right."],
+      pain: ["Yeah — that happens.", "I hear you.", "Got it."],
+      light: ["Haha, yeah.", "Fair enough.", "Yeah."],
+      negative: ["I see.", "Got it.", "Okay."],
+      neutral: ["Mm-hmm.", "I see.", "Gotcha."],
+      empty: ["Got it."],
+    },
+    "problem-check": {
+      positive: ["That makes sense.", "Got it.", "Right."],
+      pain: ["Yeah — that happens.", "Totally.", "I get that."],
+      light: ["Yeah, fair enough.", "Haha, yeah.", "Got it."],
+      negative: ["No problem.", "I understand.", "Got it."],
+      neutral: ["I see.", "Mm-hmm.", "Gotcha."],
+      empty: ["I see."],
+    },
+    close: {
+      positive: ["Sounds good.", "Perfect.", "Great."],
+      pain: ["Got it.", "I understand.", "Okay."],
+      light: ["Fair enough.", "Alright.", "Okay."],
+      negative: ["No worries.", "Totally fine.", "Got it."],
+      neutral: ["Alright.", "Okay.", "I see."],
+      empty: ["No worries."],
+    },
+  };
+
+  const stepMap = reactions[step] || reactions.intro;
+  return pickRandom(stepMap[intent] || stepMap.neutral);
+}
+
+// -----------------------------
+// OpenAI generation
+// -----------------------------
+async function generateCoreReply(step, userText = "") {
   const trimmedUserText = (userText || "").trim();
 
   if (!trimmedUserText) {
     if (step === "intro") {
-      return "Got it. Do you ever miss calls when things get busy?";
+      return "Do you ever miss calls when things get busy?";
     }
     if (step === "problem-check") {
-      return "I see. This is actually an AI assistant. Would you be open to trying something like this?";
+      return "We help capture missed calls and turn them into bookings. This is actually an AI assistant. Would you be open to trying something like this?";
     }
-    return "No worries. Thanks for your time.";
+    return "Thanks for your time.";
   }
 
   let stageInstruction = "";
 
   if (step === "intro") {
     stageInstruction = `
-You are in the early discovery part of the call.
 Goal:
-- Briefly react to what the person said
 - Ask whether they ever miss calls when things get busy
 
-Output rules:
-- Max 2 short sentences
-- Sound natural and human
-- No long explanations
+Rules:
+- Return only ONE short spoken follow-up question
+- Prefer 6 to 10 words
+- Do not include a reaction
+- Do not explain
+- Do not mention AI yet
 - Do not mention pricing
-- Do not say you are AI yet
 `;
   } else if (step === "problem-check") {
     stageInstruction = `
-You are in the offer transition part of the call.
 Goal:
-- Briefly react
-- Say in one short sentence that Ringmate helps capture missed calls and turn them into bookings
-- Then say this is an AI assistant
-- Then ask if they would be open to trying something like this
+- Briefly say Ringmate helps capture missed calls and turn them into bookings
+- Mention this is an AI assistant
+- Ask if they would be open to trying something like this
 
-Output rules:
-- Max 3 very short sentences
-- Sound casual and natural
+Rules:
+- Return only 2 or 3 very short spoken sentences
+- Do not include a reaction
 - Keep it concise
 - No pricing
 - No technical explanation
 `;
   } else {
     stageInstruction = `
-You are in the closing part of the call.
 Goal:
-- If the user sounds positive/interested, politely say someone will follow up
-- If the user sounds negative/not interested, politely thank them and end
-- If unclear, end politely and lightly
+- If the person sounds interested, say someone will follow up
+- If not interested, politely thank them and end
+- If unclear, end politely
 
-Output rules:
-- Max 2 short sentences
-- End the call naturally
+Rules:
+- Return only 1 or 2 short spoken sentences
+- Do not include a reaction
 - No extra pitch
 `;
   }
 
   const response = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    temperature: 0.3,
-    max_tokens: 80,
+    temperature: 0.25,
+    max_tokens: 40,
     messages: [
       {
         role: "system",
         content: `
-You are Emily from Ringmate calling a small business.
+You are Emily from Ringmate speaking on a phone call.
 
-Important style rules:
-- Sound like a real human, not a chatbot
-- Use short spoken sentences
-- Be warm, calm, and casual
-- Do not be overly cheerful
+Style rules:
+- Sound human and casual
+- Sound spoken, not written
+- Keep it short
 - Never ramble
-- Never use bullet points
-- Never give long explanations
-- Keep the call moving
-- Stay focused on missed calls / bookings
+- Use simple words
+- No bullet points
+- No polished sales language
         `.trim(),
       },
       {
@@ -197,15 +283,24 @@ Important style rules:
 
   if (!text) {
     if (step === "intro") {
-      return "Got it. Do you ever miss calls when things get busy?";
+      return "Do you ever miss calls when things get busy?";
     }
     if (step === "problem-check") {
-      return "I see. This is actually an AI assistant. Would you be open to trying something like this?";
+      return "We help capture missed calls and turn them into bookings. This is actually an AI assistant. Would you be open to trying something like this?";
     }
-    return "No worries. Thanks for your time.";
+    return "Thanks for your time.";
   }
 
   return text.replace(/\s+/g, " ").trim();
+}
+
+async function generateReply(step, userText = "") {
+  const intent = detectIntent(userText);
+  const reaction = getReaction(intent, step);
+  const core = await generateCoreReply(step, userText);
+
+  if (!core) return reaction;
+  return `${reaction} ${core}`.replace(/\s+/g, " ").trim();
 }
 
 // -----------------------------
@@ -232,7 +327,12 @@ app.post("/voice/incoming", async (req, res) => {
   try {
     console.log("===== /voice/incoming called =====");
 
-    if (!ELEVENLABS_API_KEY || !VOICE_ID || !PUBLIC_BASE_URL || !OPENAI_API_KEY) {
+    if (
+      !ELEVENLABS_API_KEY ||
+      !VOICE_ID ||
+      !PUBLIC_BASE_URL ||
+      !OPENAI_API_KEY
+    ) {
       return res.status(500).send("Missing environment variables");
     }
 
@@ -265,10 +365,10 @@ app.post("/voice/process", async (req, res) => {
     console.log("step:", step);
     console.log("userText:", userText);
 
-    const text = await generateReply(step, userText);
-    console.log("aiReply:", text);
+    const replyText = await generateReply(step, userText);
+    console.log("aiReply:", replyText);
 
-    const audioUrl = await createSingleAudioUrl(text);
+    const audioUrl = await createSingleAudioUrl(replyText);
     const nextStep = getNextStep(step);
 
     const twiml =
@@ -286,12 +386,17 @@ app.post("/voice/process", async (req, res) => {
       console.error("data:", error.response.data);
     }
 
-    const fallbackText = "Sorry — something went wrong. Thanks for your time.";
-    const fallbackAudioUrl = await createSingleAudioUrl(fallbackText);
-    const twiml = buildHangupTwiml(fallbackAudioUrl);
+    try {
+      const fallbackText = "Sorry — something went wrong. Thanks for your time.";
+      const fallbackAudioUrl = await createSingleAudioUrl(fallbackText);
+      const twiml = buildHangupTwiml(fallbackAudioUrl);
 
-    res.set("Content-Type", "text/xml");
-    return res.send(twiml);
+      res.set("Content-Type", "text/xml");
+      return res.send(twiml);
+    } catch (fallbackError) {
+      console.error("fallback error:", fallbackError.message);
+      return res.status(500).send("Server error");
+    }
   }
 });
 
