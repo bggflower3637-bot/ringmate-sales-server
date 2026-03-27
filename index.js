@@ -12,7 +12,6 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const VOICE_ID = process.env.VOICE_ID;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 
-// 오디오 임시 저장소
 const audioStore = new Map();
 
 // -----------------------------
@@ -33,7 +32,7 @@ async function generateSpeech(text) {
       voice_settings: {
         stability: 0.35,
         similarity_boost: 0.85,
-        style: 0.3,
+        style: 0.22,
         use_speaker_boost: true
       }
     },
@@ -44,7 +43,7 @@ async function generateSpeech(text) {
 }
 
 // -----------------------------
-// 오디오 저장
+// Audio store
 // -----------------------------
 function saveAudio(id, buffer) {
   audioStore.set(id, buffer);
@@ -54,54 +53,15 @@ function saveAudio(id, buffer) {
   }, 10 * 60 * 1000);
 }
 
-// -----------------------------
-// 여러 문장을 오디오 URL로 변환
-// -----------------------------
-async function createAudioUrls(lines) {
-  const urls = [];
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    console.log(`Generating speech ${i + 1}/${lines.length}:`, line);
-
-    const buffer = await generateSpeech(line);
-    const id = `line-${Date.now()}-${i}`;
-
-    saveAudio(id, buffer);
-
-    const url = `${PUBLIC_BASE_URL}/audio/${id}`;
-    urls.push(url);
-
-    console.log("Saved audio URL:", url);
-  }
-
-  return urls;
+async function createSingleAudioUrl(text) {
+  const buffer = await generateSpeech(text);
+  const id = `audio-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+  saveAudio(id, buffer);
+  return `${PUBLIC_BASE_URL}/audio/${id}`;
 }
 
 // -----------------------------
-// TwiML 생성
-// -----------------------------
-function buildTwiml(urls, gatherAction = "/voice/process") {
-  let twiml = `<?xml version="1.0" encoding="UTF-8"?>`;
-  twiml += `<Response>`;
-
-  for (const url of urls) {
-    twiml += `<Play>${url}</Play>`;
-    twiml += `<Pause length="1"/>`;
-  }
-
-  // 상대방 말 받기용 Gather
-  twiml += `
-    <Gather input="speech" action="${gatherAction}" method="POST" speechTimeout="auto" language="en-US">
-    </Gather>
-  `;
-
-  twiml += `</Response>`;
-  return twiml;
-}
-
-// -----------------------------
-// 간단한 의도 분류
+// Intent detection
 // -----------------------------
 function detectIntent(text = "") {
   const t = text.toLowerCase();
@@ -153,9 +113,6 @@ function detectIntent(text = "") {
   return "neutral";
 }
 
-// -----------------------------
-// 리액션 선택
-// -----------------------------
 function getReaction(intent) {
   switch (intent) {
     case "funny":
@@ -172,65 +129,75 @@ function getReaction(intent) {
 }
 
 // -----------------------------
-// 단계별 다음 멘트
+// Dialogue builder
 // -----------------------------
-function getNextLines(step, userText = "") {
+function getStepText(step, userText = "") {
   const intent = detectIntent(userText);
   const reaction = getReaction(intent);
 
   if (step === "intro") {
-    return [
-      reaction,
-      "Do you ever miss calls when things get busy?"
-    ];
+    return `${reaction} Do you ever miss calls when things get busy?`;
   }
 
   if (step === "problem-check") {
-    return [
-      reaction,
-      "We help capture missed calls and turn them into bookings.",
-      "By the way — this is actually an AI assistant.",
-      "Would you be open to trying something like this?"
-    ];
+    return `${reaction} We help capture missed calls and turn them into bookings. By the way — this is actually an AI assistant. Would you be open to trying something like this?`;
   }
 
   if (step === "close") {
     if (intent === "positive") {
-      return [
-        "Nice.",
-        "I’ll have someone follow up with you."
-      ];
+      return `Nice. I’ll have someone follow up with you.`;
     }
 
     if (intent === "negative") {
-      return [
-        "All good.",
-        "Appreciate your time."
-      ];
+      return `All good. Appreciate your time.`;
     }
 
-    return [
-      "No worries.",
-      "Just wanted to check."
-    ];
+    return `No worries. Just wanted to check.`;
   }
 
-  return [
-    "Mm-hmm.",
-    "Could you say that again?"
-  ];
+  return `Mm-hmm. Could you say that again?`;
+}
+
+function getNextStep(currentStep) {
+  if (currentStep === "intro") return "problem-check";
+  if (currentStep === "problem-check") return "close";
+  return "done";
 }
 
 // -----------------------------
-// 서버 상태 확인
+// TwiML builders
+// -----------------------------
+function buildGatherTwiml(audioUrl, nextStep) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${audioUrl}</Play>
+  <Gather
+    input="speech"
+    action="${PUBLIC_BASE_URL}/voice/process?step=${nextStep}"
+    method="POST"
+    speechTimeout="1"
+    actionOnEmptyResult="true"
+    language="en-US">
+  </Gather>
+  <Redirect method="POST">${PUBLIC_BASE_URL}/voice/process?step=${nextStep}</Redirect>
+</Response>`;
+}
+
+function buildHangupTwiml(audioUrl) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${audioUrl}</Play>
+  <Hangup/>
+</Response>`;
+}
+
+// -----------------------------
+// Routes
 // -----------------------------
 app.get("/", (req, res) => {
   res.send("Ringmate Sales AI Server Running");
 });
 
-// -----------------------------
-// 저장된 오디오 제공
-// -----------------------------
 app.get("/audio/:id", (req, res) => {
   const { id } = req.params;
   const audio = audioStore.get(id);
@@ -244,53 +211,32 @@ app.get("/audio/:id", (req, res) => {
   return res.send(audio);
 });
 
-// -----------------------------
-// 첫 진입
-// -----------------------------
 app.post("/voice/incoming", async (req, res) => {
   try {
     console.log("===== /voice/incoming called =====");
-    console.log("ENV CHECK:", {
-      hasApiKey: !!ELEVENLABS_API_KEY,
-      hasVoiceId: !!VOICE_ID,
-      hasBaseUrl: !!PUBLIC_BASE_URL,
-      baseUrl: PUBLIC_BASE_URL || null
-    });
 
     if (!ELEVENLABS_API_KEY || !VOICE_ID || !PUBLIC_BASE_URL) {
-      console.log("Missing environment variables");
       return res.status(500).send("Missing environment variables");
     }
 
-    const lines = [
-      "Hi — this is Emily from Ringmate.",
-      "Quick question.",
-      "Are you handling calls yourself right now?"
-    ];
+    const introText =
+      "Hi — this is Emily from Ringmate. Quick question. Are you handling calls yourself right now?";
 
-    const urls = await createAudioUrls(lines);
-    const twiml = buildTwiml(urls, `${PUBLIC_BASE_URL}/voice/process?step=intro`);
-
-    console.log("Generated intro TwiML successfully");
+    const introAudioUrl = await createSingleAudioUrl(introText);
+    const twiml = buildGatherTwiml(introAudioUrl, "intro");
 
     res.set("Content-Type", "text/xml");
     return res.send(twiml);
   } catch (error) {
-    console.error("incoming error:");
-    console.error("message:", error.message);
-
+    console.error("incoming error:", error.message);
     if (error.response) {
       console.error("status:", error.response.status);
       console.error("data:", error.response.data);
     }
-
     return res.status(500).send("Server error");
   }
 });
 
-// -----------------------------
-// 상대방 음성 처리
-// -----------------------------
 app.post("/voice/process", async (req, res) => {
   try {
     const step = req.query.step || "intro";
@@ -300,48 +246,23 @@ app.post("/voice/process", async (req, res) => {
     console.log("step:", step);
     console.log("userText:", userText);
 
-    let nextStep = "problem-check";
+    const text = getStepText(step, userText);
+    const audioUrl = await createSingleAudioUrl(text);
+    const nextStep = getNextStep(step);
 
-    if (step === "problem-check") {
-      nextStep = "close";
-    } else if (step === "close") {
-      nextStep = "done";
-    }
-
-    const lines = getNextLines(step, userText);
-    const urls = await createAudioUrls(lines);
-
-    let twiml = `<?xml version="1.0" encoding="UTF-8"?><Response>`;
-
-    for (const url of urls) {
-      twiml += `<Play>${url}</Play>`;
-      twiml += `<Pause length="1"/>`;
-    }
-
-    if (nextStep !== "done") {
-      twiml += `
-        <Gather input="speech" action="${PUBLIC_BASE_URL}/voice/process?step=${nextStep}" method="POST" speechTimeout="auto" language="en-US">
-        </Gather>
-      `;
-    } else {
-      twiml += `<Hangup/>`;
-    }
-
-    twiml += `</Response>`;
-
-    console.log("Generated process TwiML successfully");
+    const twiml =
+      nextStep === "done"
+        ? buildHangupTwiml(audioUrl)
+        : buildGatherTwiml(audioUrl, nextStep);
 
     res.set("Content-Type", "text/xml");
     return res.send(twiml);
   } catch (error) {
-    console.error("process error:");
-    console.error("message:", error.message);
-
+    console.error("process error:", error.message);
     if (error.response) {
       console.error("status:", error.response.status);
       console.error("data:", error.response.data);
     }
-
     return res.status(500).send("Server error");
   }
 });
