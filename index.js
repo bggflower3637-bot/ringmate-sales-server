@@ -66,15 +66,8 @@ async function createSingleAudioUrl(text) {
 }
 
 // -----------------------------
-// Call flow helpers
+// TwiML helpers
 // -----------------------------
-function getNextStep(currentStep) {
-  if (currentStep === "warmup") return "intro";
-  if (currentStep === "intro") return "problem-check";
-  if (currentStep === "problem-check") return "close";
-  return "done";
-}
-
 function buildGatherTwiml(audioUrl, nextStep) {
   return `
 <Response>
@@ -99,10 +92,100 @@ function buildHangupTwiml(audioUrl) {
 }
 
 // -----------------------------
-// Intent / question detection
+// Fixed text blocks
 // -----------------------------
+function getWarmupText() {
+  return [
+    "Hi — this is Emily with Ringmate.",
+    "We help businesses handle missed calls and turn them into bookings.",
+    "Hope you're having a good day so far.",
+  ].join(" ");
+}
+
+function getSimpleQuestionAnswer() {
+  return [
+    "Yeah — absolutely.",
+    "We help businesses catch missed calls and turn them into bookings.",
+  ].join(" ");
+}
+
+function getDeepQuestionHandoffText() {
+  return [
+    "Got it — great question.",
+    "One of our team members can walk you through that in more detail.",
+    "They’ll reach out shortly.",
+  ].join(" ");
+}
+
+function getInterestedHandoffText() {
+  return [
+    "That makes sense.",
+    "I’ll have someone from our team reach out and walk you through it.",
+    "Really appreciate your time today.",
+  ].join(" ");
+}
+
+function getNotInterestedClosingText() {
+  return [
+    "No worries at all.",
+    "Thanks for taking the call.",
+    "Have a great rest of your day.",
+  ].join(" ");
+}
+
+function getSoftClosingText() {
+  return [
+    "Totally understand.",
+    "If it ever becomes a problem, we'd be happy to help.",
+    "Really appreciate your time today.",
+  ].join(" ");
+}
+
+// -----------------------------
+// Detection helpers
+// -----------------------------
+function normalizeText(text = "") {
+  return text.toLowerCase().trim();
+}
+
+function isSimpleQuestion(text = "") {
+  const t = normalizeText(text);
+
+  return (
+    t.includes("what is this") ||
+    t.includes("what's this") ||
+    t.includes("what is this about") ||
+    t.includes("what's this about") ||
+    t.includes("what do you do") ||
+    t.includes("who is this") ||
+    t.includes("why are you calling") ||
+    t.includes("what is ringmate") ||
+    t === "what is this" ||
+    t === "who is this" ||
+    t === "why are you calling"
+  );
+}
+
+function isDeepQuestion(text = "") {
+  const t = normalizeText(text);
+
+  return (
+    t.includes("how does it work") ||
+    t.includes("how exactly") ||
+    t.includes("how much") ||
+    t.includes("price") ||
+    t.includes("cost") ||
+    t.includes("features") ||
+    t.includes("difference") ||
+    t.includes("compare") ||
+    t.includes("integration") ||
+    t.includes("setup") ||
+    t.includes("what does it cost")
+  );
+}
+
 function detectIntent(text = "") {
-  const t = text.toLowerCase().trim();
+  const t = normalizeText(text);
 
   if (!t) return "empty";
 
@@ -113,7 +196,8 @@ function detectIntent(text = "") {
     t.includes("we are good") ||
     t.includes("don't need") ||
     t.includes("do not need") ||
-    t.includes("nope")
+    t.includes("nope") ||
+    t.includes("not really")
   ) {
     return "negative";
   }
@@ -139,45 +223,19 @@ function detectIntent(text = "") {
     t.includes("ok") ||
     t.includes("maybe") ||
     t.includes("possibly") ||
-    t.includes("interested")
+    t.includes("interested") ||
+    t.includes("sounds good") ||
+    t.includes("that works")
   ) {
     return "positive";
-  }
-
-  if (t.includes("haha") || t.includes("lol") || t.includes("funny")) {
-    return "light";
   }
 
   return "neutral";
 }
 
-function isQuestion(text = "") {
-  const t = text.toLowerCase().trim();
-
-  if (!t) return false;
-
-  return (
-    t.includes("?") ||
-    t.startsWith("what") ||
-    t.startsWith("how") ||
-    t.startsWith("why") ||
-    t.startsWith("when") ||
-    t.startsWith("who") ||
-    t.startsWith("where") ||
-    t.startsWith("can") ||
-    t.startsWith("is") ||
-    t.startsWith("are") ||
-    t.includes("what is") ||
-    t.includes("how does") ||
-    t.includes("how much") ||
-    t.includes("who are you") ||
-    t.includes("what do you do") ||
-    t.includes("why are you calling")
-  );
-}
-
 function soundsInterested(text = "") {
-  const t = text.toLowerCase();
+  const t = normalizeText(text);
+
   return (
     t.includes("yes") ||
     t.includes("yeah") ||
@@ -187,8 +245,9 @@ function soundsInterested(text = "") {
     t.includes("interested") ||
     t.includes("open to that") ||
     t.includes("open to it") ||
+    t.includes("sounds good") ||
     t.includes("that works") ||
-    t.includes("sounds good")
+    t.includes("maybe")
   );
 }
 
@@ -196,77 +255,22 @@ function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-function getReaction(intent, step) {
+function getReaction(intent) {
   const reactions = {
-    intro: {
-      positive: ["Got it.", "Okay.", "Right."],
-      pain: ["Yeah — that happens.", "I hear you.", "Got it."],
-      light: ["Haha, yeah.", "Fair enough.", "Yeah."],
-      negative: ["I see.", "Got it.", "Okay."],
-      neutral: ["Mm-hmm.", "I see.", "Gotcha."],
-      empty: ["Got it."],
-    },
-    "problem-check": {
-      positive: ["That makes sense.", "Got it.", "Right."],
-      pain: ["Yeah — that happens.", "Totally.", "I get that."],
-      light: ["Yeah, fair enough.", "Haha, yeah.", "Got it."],
-      negative: ["No problem.", "I understand.", "Got it."],
-      neutral: ["I see.", "Mm-hmm.", "Gotcha."],
-      empty: ["I see."],
-    },
+    positive: ["Got it.", "Okay.", "Right."],
+    pain: ["Yeah — that happens.", "I hear you.", "Got it."],
+    negative: ["I see.", "Got it.", "Okay."],
+    neutral: ["Mm-hmm.", "I see.", "Gotcha."],
+    empty: ["Got it."],
   };
 
-  const stepMap = reactions[step] || reactions.intro;
-  return pickRandom(stepMap[intent] || stepMap.neutral);
+  return pickRandom(reactions[intent] || reactions.neutral);
 }
 
 // -----------------------------
-// Fixed opening / closing
+// OpenAI core generation
 // -----------------------------
-function getWarmupText() {
-  return [
-    "Hi — this is Emily with Ringmate.",
-    "We help businesses handle missed calls and turn them into bookings.",
-    "Hope you're having a good day so far.",
-  ].join(" ");
-}
-
-function getQuestionHandoffText() {
-  return [
-    "Got it — great question.",
-    "I’ll have someone from our team reach out and walk you through it properly.",
-    "Really appreciate your time today.",
-  ].join(" ");
-}
-
-function getInterestedHandoffText() {
-  return [
-    "That makes sense.",
-    "I’ll have someone from our team reach out and walk you through it.",
-    "Really appreciate you taking a moment to chat today.",
-  ].join(" ");
-}
-
-function getNotInterestedClosingText() {
-  return [
-    "No worries at all.",
-    "Thanks for taking the call.",
-    "Have a great rest of your day.",
-  ].join(" ");
-}
-
-function getSoftClosingText() {
-  return [
-    "Totally understand.",
-    "If it ever becomes a problem, we'd be happy to help.",
-    "Really appreciate your time today.",
-  ].join(" ");
-}
-
-// -----------------------------
-// OpenAI core reply
-// -----------------------------
-async function generateCoreReply(step, userText = "") {
+async function generateShortReply(step, userText = "") {
   const trimmedUserText = (userText || "").trim();
 
   if (!trimmedUserText) {
@@ -286,11 +290,10 @@ async function generateCoreReply(step, userText = "") {
   if (step === "intro") {
     stageInstruction = `
 Goal:
-- Move from their response into one short discovery question
+- Move naturally into a short discovery question
 
 Rules:
 - Return only 1 or 2 short spoken sentences
-- Prefer 8 to 16 words total when possible
 - Do not explain the company again
 - Do not mention AI
 - Do not mention pricing
@@ -301,7 +304,7 @@ Rules:
     stageInstruction = `
 Goal:
 - Briefly say Ringmate helps with missed calls and bookings
-- Ask if they would be open to learning more
+- Ask whether they would be open to learning more
 
 Rules:
 - Return only 2 or 3 short spoken sentences
@@ -313,7 +316,7 @@ Rules:
   } else {
     stageInstruction = `
 Goal:
-- End the call politely
+- End politely
 
 Rules:
 - Return only 1 short spoken sentence
@@ -336,9 +339,7 @@ Style rules:
 - Sound spoken, not written
 - Keep it short
 - Never ramble
-- Never sound like a script reader
-- Use simple, natural phone language
-- If the user asks a question, do not answer in detail
+- Use simple natural phone language
         `.trim(),
       },
       {
@@ -371,8 +372,8 @@ Style rules:
 
 async function generateReply(step, userText = "") {
   const intent = detectIntent(userText);
-  const reaction = getReaction(intent, step);
-  const core = await generateCoreReply(step, userText);
+  const reaction = getReaction(intent);
+  const core = await generateShortReply(step, userText);
 
   if (!core) return reaction;
   return `${reaction} ${core}`.replace(/\s+/g, " ").trim();
@@ -438,9 +439,19 @@ app.post("/voice/process", async (req, res) => {
     console.log("step:", step);
     console.log("userText:", userText);
 
-    // 1) 상대가 질문하면 바로 사람 연결하고 종료
-    if (isQuestion(userText)) {
-      const replyText = getQuestionHandoffText();
+    // 1) 얕은 질문 -> AI가 짧게 설명
+    if (isSimpleQuestion(userText)) {
+      const replyText = getSimpleQuestionAnswer();
+      const audioUrl = await createSingleAudioUrl(replyText);
+      const twiml = buildGatherTwiml(audioUrl, "problem-check");
+
+      res.set("Content-Type", "text/xml");
+      return res.send(twiml);
+    }
+
+    // 2) 깊은 질문 -> 사람에게 넘기고 종료
+    if (isDeepQuestion(userText)) {
+      const replyText = getDeepQuestionHandoffText();
       const audioUrl = await createSingleAudioUrl(replyText);
       const twiml = buildHangupTwiml(audioUrl);
 
@@ -448,7 +459,7 @@ app.post("/voice/process", async (req, res) => {
       return res.send(twiml);
     }
 
-    // 2) warmup 단계: 왜 전화했는지 바로 짧게 묻기
+    // 3) 첫 반응 이후 -> 짧은 질문으로 진입
     if (step === "warmup") {
       const replyText =
         "Got it. Just wanted to ask real quick — are you usually the one handling calls there?";
@@ -459,7 +470,7 @@ app.post("/voice/process", async (req, res) => {
       return res.send(twiml);
     }
 
-    // 3) 관심 있다고 느껴지면 사람 연결하고 종료
+    // 4) 관심 있음 -> 사람 연결 후 종료
     if (soundsInterested(userText)) {
       const replyText = getInterestedHandoffText();
       const audioUrl = await createSingleAudioUrl(replyText);
@@ -469,7 +480,7 @@ app.post("/voice/process", async (req, res) => {
       return res.send(twiml);
     }
 
-    // 4) 관심 없다고 느껴지면 자연스럽게 종료
+    // 5) 관심 없음 -> 자연스럽게 종료
     if (detectIntent(userText) === "negative") {
       const replyText = getNotInterestedClosingText();
       const audioUrl = await createSingleAudioUrl(replyText);
@@ -479,14 +490,19 @@ app.post("/voice/process", async (req, res) => {
       return res.send(twiml);
     }
 
-    // 5) 그 외에는 짧게만 진행
+    // 6) 나머지 -> 짧게 진행
     const replyText = await generateReply(step, userText);
     console.log("aiReply:", replyText);
 
-    const nextStep = getNextStep(step);
+    if (step === "problem-check") {
+      const audioUrl = await createSingleAudioUrl(replyText);
+      const twiml = buildGatherTwiml(audioUrl, "close");
 
-    // close 단계면 부드럽게 마무리
-    if (nextStep === "done") {
+      res.set("Content-Type", "text/xml");
+      return res.send(twiml);
+    }
+
+    if (step === "close") {
       const finalText = getSoftClosingText();
       const audioUrl = await createSingleAudioUrl(finalText);
       const twiml = buildHangupTwiml(audioUrl);
@@ -496,7 +512,7 @@ app.post("/voice/process", async (req, res) => {
     }
 
     const audioUrl = await createSingleAudioUrl(replyText);
-    const twiml = buildGatherTwiml(audioUrl, nextStep);
+    const twiml = buildGatherTwiml(audioUrl, "problem-check");
 
     res.set("Content-Type", "text/xml");
     return res.send(twiml);
