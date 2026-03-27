@@ -35,9 +35,9 @@ async function generateSpeech(text) {
       text,
       model_id: "eleven_turbo_v2",
       voice_settings: {
-        stability: 0.4,
-        similarity_boost: 0.8,
-        style: 0.08,
+        stability: 0.55,
+        similarity_boost: 0.75,
+        style: 0.04,
         use_speaker_boost: true,
       },
     },
@@ -91,6 +91,22 @@ function buildHangupTwiml(audioUrl) {
 </Response>`;
 }
 
+async function respondAndHangup(text, res) {
+  const audioUrl = await createSingleAudioUrl(text);
+  const twiml = buildHangupTwiml(audioUrl);
+
+  res.set("Content-Type", "text/xml");
+  return res.send(twiml);
+}
+
+async function respondAndContinue(text, nextStep, res) {
+  const audioUrl = await createSingleAudioUrl(text);
+  const twiml = buildGatherTwiml(audioUrl, nextStep);
+
+  res.set("Content-Type", "text/xml");
+  return res.send(twiml);
+}
+
 // -----------------------------
 // Fixed text blocks
 // -----------------------------
@@ -138,6 +154,30 @@ function getSoftClosingText() {
     "Totally understand.",
     "If it ever becomes a problem, we'd be happy to help.",
     "Really appreciate your time today.",
+  ].join(" ");
+}
+
+function getLanguageHandoffText() {
+  return [
+    "No problem at all.",
+    "I can have someone follow up with you by text instead.",
+    "Really appreciate your time.",
+  ].join(" ");
+}
+
+function getBusyHandoffText() {
+  return [
+    "Totally understand.",
+    "I’ll have someone reach out at a better time.",
+    "Really appreciate it.",
+  ].join(" ");
+}
+
+function getTrustHandoffText() {
+  return [
+    "Yeah — totally fair.",
+    "We work with local businesses to help with missed calls.",
+    "I can have someone follow up and explain everything.",
   ].join(" ");
 }
 
@@ -249,6 +289,44 @@ function soundsInterested(text = "") {
     t.includes("that works") ||
     t.includes("maybe")
   );
+}
+
+function detectSpecialCase(text = "") {
+  const t = normalizeText(text);
+
+  if (
+    t.includes("can't speak english") ||
+    t.includes("cannot speak english") ||
+    t.includes("don't speak english") ||
+    t.includes("do not speak english") ||
+    t.includes("not good at english") ||
+    t.includes("i don't understand english") ||
+    t.includes("i do not understand english") ||
+    t.includes("hard to understand")
+  ) {
+    return "language";
+  }
+
+  if (
+    t.includes("i'm busy") ||
+    t.includes("i am busy") ||
+    t.includes("busy right now") ||
+    t.includes("call later") ||
+    t.includes("not now") ||
+    t.includes("can you call back")
+  ) {
+    return "busy";
+  }
+
+  if (
+    t.includes("who gave you this number") ||
+    t.includes("where did you get my number") ||
+    t.includes("how did you get my number")
+  ) {
+    return "trust";
+  }
+
+  return null;
 }
 
 function pickRandom(arr) {
@@ -439,83 +517,61 @@ app.post("/voice/process", async (req, res) => {
     console.log("step:", step);
     console.log("userText:", userText);
 
-    // 1) 얕은 질문 -> AI가 짧게 설명
+    // 1) 예외 처리
+    const special = detectSpecialCase(userText);
+
+    if (special === "language") {
+      return respondAndHangup(getLanguageHandoffText(), res);
+    }
+
+    if (special === "busy") {
+      return respondAndHangup(getBusyHandoffText(), res);
+    }
+
+    if (special === "trust") {
+      return respondAndHangup(getTrustHandoffText(), res);
+    }
+
+    // 2) 얕은 질문 -> AI가 짧게 설명
     if (isSimpleQuestion(userText)) {
-      const replyText = getSimpleQuestionAnswer();
-      const audioUrl = await createSingleAudioUrl(replyText);
-      const twiml = buildGatherTwiml(audioUrl, "problem-check");
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
+      return respondAndContinue(getSimpleQuestionAnswer(), "problem-check", res);
     }
 
-    // 2) 깊은 질문 -> 사람에게 넘기고 종료
+    // 3) 깊은 질문 -> 사람에게 넘기고 종료
     if (isDeepQuestion(userText)) {
-      const replyText = getDeepQuestionHandoffText();
-      const audioUrl = await createSingleAudioUrl(replyText);
-      const twiml = buildHangupTwiml(audioUrl);
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
+      return respondAndHangup(getDeepQuestionHandoffText(), res);
     }
 
-    // 3) 첫 반응 이후 -> 짧은 질문으로 진입
+    // 4) 첫 반응 이후 -> 짧은 질문 진입
     if (step === "warmup") {
       const replyText =
         "Got it. Just wanted to ask real quick — are you usually the one handling calls there?";
-      const audioUrl = await createSingleAudioUrl(replyText);
-      const twiml = buildGatherTwiml(audioUrl, "intro");
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
+      return respondAndContinue(replyText, "intro", res);
     }
 
-    // 4) 관심 있음 -> 사람 연결 후 종료
+    // 5) 관심 있음 -> 사람 연결 후 종료
     if (soundsInterested(userText)) {
-      const replyText = getInterestedHandoffText();
-      const audioUrl = await createSingleAudioUrl(replyText);
-      const twiml = buildHangupTwiml(audioUrl);
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
+      return respondAndHangup(getInterestedHandoffText(), res);
     }
 
-    // 5) 관심 없음 -> 자연스럽게 종료
+    // 6) 관심 없음 -> 자연스럽게 종료
     if (detectIntent(userText) === "negative") {
-      const replyText = getNotInterestedClosingText();
-      const audioUrl = await createSingleAudioUrl(replyText);
-      const twiml = buildHangupTwiml(audioUrl);
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
+      return respondAndHangup(getNotInterestedClosingText(), res);
     }
 
-    // 6) 나머지 -> 짧게 진행
+    // 7) 나머지 -> GPT로 짧게 진행
     const replyText = await generateReply(step, userText);
     console.log("aiReply:", replyText);
 
     if (step === "problem-check") {
-      const audioUrl = await createSingleAudioUrl(replyText);
-      const twiml = buildGatherTwiml(audioUrl, "close");
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
+      return respondAndContinue(replyText, "close", res);
     }
 
     if (step === "close") {
-      const finalText = getSoftClosingText();
-      const audioUrl = await createSingleAudioUrl(finalText);
-      const twiml = buildHangupTwiml(audioUrl);
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
+      return respondAndHangup(getSoftClosingText(), res);
     }
 
-    const audioUrl = await createSingleAudioUrl(replyText);
-    const twiml = buildGatherTwiml(audioUrl, "problem-check");
-
-    res.set("Content-Type", "text/xml");
-    return res.send(twiml);
+    return respondAndContinue(replyText, "problem-check", res);
   } catch (error) {
     console.error("process error:", error.message);
 
@@ -526,11 +582,7 @@ app.post("/voice/process", async (req, res) => {
 
     try {
       const fallbackText = "Sorry — something went wrong. Thanks for your time.";
-      const fallbackAudioUrl = await createSingleAudioUrl(fallbackText);
-      const twiml = buildHangupTwiml(fallbackAudioUrl);
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
+      return respondAndHangup(fallbackText, res);
     } catch (fallbackError) {
       console.error("fallback error:", fallbackError.message);
       return res.status(500).send("Server error");
