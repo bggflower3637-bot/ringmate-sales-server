@@ -16,6 +16,26 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.PUBLIC_BASE_URL;
 
+if (!BASE_URL) {
+  console.error("Missing PUBLIC_BASE_URL in environment variables.");
+  process.exit(1);
+}
+
+const requiredEnv = [
+  "OPENAI_API_KEY",
+  "ELEVENLABS_API_KEY",
+  "ELEVENLABS_VOICE_ID",
+  "TWILIO_ACCOUNT_SID",
+  "TWILIO_AUTH_TOKEN",
+];
+
+for (const key of requiredEnv) {
+  if (!process.env[key]) {
+    console.error(`Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
+}
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -33,13 +53,16 @@ const ttsDir = path.join(publicDir, "tts");
 const fillersDir = path.join(publicDir, "fillers");
 
 if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
-if (!fs.existsSync(ttsDir)) fs.mkdirSync(ttsDir);
-if (!fs.existsSync(fillersDir)) fs.mkdirSync(fillersDir);
+if (!fs.existsSync(ttsDir)) fs.mkdirSync(ttsDir, { recursive: true });
+if (!fs.existsSync(fillersDir)) fs.mkdirSync(fillersDir, { recursive: true });
 
 app.use("/tts", express.static(ttsDir));
 app.use("/fillers", express.static(fillersDir));
 
 const calls = new Map();
+const SILENCE_THRESHOLD_MS = 900;
+const SILENCE_CHECK_INTERVAL_MS = 250;
+const MAX_QUEUE_ITEMS = 12;
 
 function now() {
   return new Date().toISOString();
@@ -49,15 +72,23 @@ function logStep(callSid, step, extra = "") {
   console.log(`[${now()}] [${callSid}] ${step}${extra ? ` | ${extra}` : ""}`);
 }
 
+function safeTextPreview(text, max = 90) {
+  if (!text) return "";
+  const cleaned = String(text).replace(/\s+/g, " ").trim();
+  return cleaned.length > max ? `${cleaned.slice(0, max)}...` : cleaned;
+}
+
 function getCallState(callSid) {
   if (!calls.has(callSid)) {
     calls.set(callSid, {
       queue: [],
       isPlaying: false,
-      generationDone: false,
+      generationDone: true,
       lastAudioAt: Date.now(),
       destroyed: false,
       currentTurnId: null,
+      currentCallStatus: "unknown",
+      turnStartedAt: null,
     });
   }
   return calls.get(callSid);
@@ -66,7 +97,11 @@ function getCallState(callSid) {
 function cleanupCall(callSid) {
   const state = calls.get(callSid);
   if (!state) return;
+
   state.destroyed = true;
+  state.queue = [];
+  state.isPlaying = false;
+  logStep(callSid, "cleanup_call");
   calls.delete(callSid);
 }
 
@@ -83,37 +118,102 @@ function randomPick(arr) {
 
 function enqueueAudio(callSid, audioUrl, type = "speech", turnId = null) {
   const state = getCallState(callSid);
+  if (state.destroyed) return;
 
   if (turnId && state.currentTurnId && turnId !== state.currentTurnId) {
+    logStep(callSid, "skip_enqueue_old_turn", `${type}`);
     return;
+  }
+
+  if (state.queue.length >= MAX_QUEUE_ITEMS) {
+    state.queue.shift();
+    logStep(callSid, "queue_trimmed", `max=${MAX_QUEUE_ITEMS}`);
   }
 
   state.queue.push({ audioUrl, type, turnId });
   logStep(callSid, "audio_enqueued", `${type} | queue=${state.queue.length}`);
 }
 
+async function getTwilioCallStatus(callSid) {
+  try {
+    const call = await twilioClient.calls(callSid).fetch();
+    return call?.status || "unknown";
+  } catch (err) {
+    logStep(callSid, "twilio_fetch_failed", err.message);
+    return "unknown";
+  }
+}
+
+function isPlayableStatus(status) {
+  return ["in-progress", "ringing", "queued"].includes(status);
+}
+
+async function canPlayToCall(callSid) {
+  if (!calls.has(callSid)) return false;
+  const state = calls.get(callSid);
+  if (!state || state.destroyed) return false;
+
+  const status = await getTwilioCallStatus(callSid);
+  state.currentCallStatus = status;
+  logStep(callSid, "call_status", status);
+
+  return isPlayableStatus(status);
+}
+
 async function pumpAudioQueue(callSid) {
   const state = getCallState(callSid);
-  if (state.destroyed || state.isPlaying) return;
+  if (!state || state.destroyed || state.isPlaying) return;
 
   state.isPlaying = true;
 
   try {
-    while (state.queue.length > 0 && !state.destroyed) {
-      const item = state.queue.shift();
+    while (state.queue.length > 0) {
+      if (!calls.has(callSid)) return;
 
-      if (item.turnId && item.turnId !== state.currentTurnId) {
+      const latestState = calls.get(callSid);
+      if (!latestState || latestState.destroyed) return;
+
+      const item = latestState.queue.shift();
+      if (!item) continue;
+
+      if (item.turnId && item.turnId !== latestState.currentTurnId) {
+        logStep(callSid, "drop_old_turn_audio", item.type);
         continue;
       }
 
+      const playable = await canPlayToCall(callSid);
+      if (!playable) {
+        logStep(callSid, "call_not_playable_cleanup", latestState.currentCallStatus);
+        cleanupCall(callSid);
+        return;
+      }
+
       await instructTwilioToPlay(callSid, item.audioUrl);
-      state.lastAudioAt = Date.now();
+
+      if (!calls.has(callSid)) return;
+      const refreshed = calls.get(callSid);
+      if (!refreshed || refreshed.destroyed) return;
+
+      refreshed.lastAudioAt = Date.now();
       logStep(callSid, "audio_played", item.type);
     }
   } catch (err) {
     console.error("pumpAudioQueue error:", err.message);
+
+    if (
+      err.message.includes("not in-progress") ||
+      err.message.includes("Call is not in-progress") ||
+      err.message.includes("Cannot redirect")
+    ) {
+      logStep(callSid, "pump_cleanup_not_in_progress");
+      cleanupCall(callSid);
+      return;
+    }
   } finally {
-    state.isPlaying = false;
+    if (calls.has(callSid)) {
+      const latest = calls.get(callSid);
+      if (latest) latest.isPlaying = false;
+    }
   }
 }
 
@@ -122,7 +222,7 @@ async function startAssistantResponse(callSid, transcript, turnId) {
   if (state.destroyed) return;
 
   let buffer = "";
-  logStep(callSid, "openai_start", `turn=${turnId}`);
+  logStep(callSid, "openai_start", `turn=${turnId} | text=${safeTextPreview(transcript)}`);
 
   const stream = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -139,7 +239,7 @@ Prefer 4 to 8 words per sentence.
 Never give long explanations.
 Respond in 1 to 3 short sentences max.
 Sound immediate and conversational.
-        `.trim(),
+`.trim(),
       },
       {
         role: "user",
@@ -159,7 +259,9 @@ Sound immediate and conversational.
       logStep(callSid, "openai_first_token", `turn=${turnId}`);
     }
 
-    if (state.currentTurnId !== turnId) {
+    if (!calls.has(callSid)) return;
+    const latest = calls.get(callSid);
+    if (!latest || latest.destroyed || latest.currentTurnId !== turnId) {
       logStep(callSid, "turn_cancelled", `old_turn=${turnId}`);
       return;
     }
@@ -171,11 +273,13 @@ Sound immediate and conversational.
       if (!chunk) break;
 
       buffer = remaining;
-      logStep(callSid, "tts_start", chunk);
+      logStep(callSid, "tts_start", safeTextPreview(chunk));
       const audioUrl = await generateElevenTTS(chunk);
-      logStep(callSid, "tts_done", chunk);
+      logStep(callSid, "tts_done", safeTextPreview(chunk));
 
-      if (state.currentTurnId !== turnId) {
+      if (!calls.has(callSid)) return;
+      const current = calls.get(callSid);
+      if (!current || current.destroyed || current.currentTurnId !== turnId) {
         return;
       }
 
@@ -184,17 +288,23 @@ Sound immediate and conversational.
     }
   }
 
-  if (buffer.trim() && state.currentTurnId === turnId) {
-    logStep(callSid, "tts_start_final", buffer.trim());
+  if (!calls.has(callSid)) return;
+  const latestState = calls.get(callSid);
+
+  if (buffer.trim() && latestState && !latestState.destroyed && latestState.currentTurnId === turnId) {
+    logStep(callSid, "tts_start_final", safeTextPreview(buffer.trim()));
     const audioUrl = await generateElevenTTS(buffer.trim());
-    logStep(callSid, "tts_done_final", buffer.trim());
+    logStep(callSid, "tts_done_final", safeTextPreview(buffer.trim()));
     enqueueAudio(callSid, audioUrl, "speech", turnId);
     pumpAudioQueue(callSid).catch(console.error);
   }
 
-  if (state.currentTurnId === turnId) {
-    state.generationDone = true;
-    logStep(callSid, "generation_done", `turn=${turnId}`);
+  if (calls.has(callSid)) {
+    const current = calls.get(callSid);
+    if (current && current.currentTurnId === turnId) {
+      current.generationDone = true;
+      logStep(callSid, "generation_done", `turn=${turnId}`);
+    }
   }
 }
 
@@ -253,20 +363,34 @@ async function generateElevenTTS(text) {
 }
 
 async function instructTwilioToPlay(callSid, audioUrl) {
-  logStep(callSid, "twilio_play_start", audioUrl);
+  try {
+    logStep(callSid, "twilio_play_start", audioUrl);
 
-  const twiml = `
+    const twiml = `
 <Response>
   <Play>${audioUrl}</Play>
-  <Pause length="1"/>
-  <Redirect method="POST">${BASE_URL}/voice/waiting?callSid=${encodeURIComponent(callSid)}</Redirect>
 </Response>
-  `.trim();
+`.trim();
 
-  await twilioClient.calls(callSid).update({ twiml });
+    await twilioClient.calls(callSid).update({ twiml });
+    await sleep(900);
 
-  await sleep(900);
-  logStep(callSid, "twilio_play_sent", audioUrl);
+    logStep(callSid, "twilio_play_sent", audioUrl);
+  } catch (err) {
+    console.error(`Twilio play error for ${callSid}:`, err.message);
+
+    if (
+      err.message.includes("not in-progress") ||
+      err.message.includes("Call is not in-progress") ||
+      err.message.includes("Cannot redirect")
+    ) {
+      logStep(callSid, "call_not_in_progress_cleanup");
+      cleanupCall(callSid);
+      return;
+    }
+
+    throw err;
+  }
 }
 
 function sleep(ms) {
@@ -275,13 +399,14 @@ function sleep(ms) {
 
 setInterval(() => {
   for (const [callSid, state] of calls.entries()) {
-    if (state.destroyed) continue;
+    if (!state || state.destroyed) continue;
+    if (!state.currentTurnId) continue;
 
     const silenceMs = Date.now() - state.lastAudioAt;
     const queueEmpty = state.queue.length === 0;
 
     if (
-      silenceMs > 800 &&
+      silenceMs > SILENCE_THRESHOLD_MS &&
       !state.isPlaying &&
       !state.generationDone &&
       queueEmpty
@@ -292,11 +417,12 @@ setInterval(() => {
       logStep(callSid, "silence_killer_triggered", `${silenceMs}ms`);
     }
   }
-}, 250);
+}, SILENCE_CHECK_INTERVAL_MS);
 
 app.post("/voice/incoming", (req, res) => {
   const callSid = req.body.CallSid;
-  getCallState(callSid);
+  const state = getCallState(callSid);
+  state.currentCallStatus = "in-progress";
   logStep(callSid, "incoming_call");
 
   const twiml = `
@@ -304,7 +430,7 @@ app.post("/voice/incoming", (req, res) => {
   <Say>Hi.</Say>
   <Pause length="1"/>
 </Response>
-  `.trim();
+`.trim();
 
   res.type("text/xml").send(twiml);
 });
@@ -318,7 +444,7 @@ app.post("/voice/waiting", (req, res) => {
 <Response>
   <Pause length="1"/>
 </Response>
-  `.trim();
+`.trim();
 
   res.type("text/xml").send(twiml);
 });
@@ -338,19 +464,45 @@ app.post("/voice/turn-ended", async (req, res) => {
     state.generationDone = false;
     state.queue = [];
     state.lastAudioAt = Date.now();
+    state.turnStartedAt = Date.now();
 
-    logStep(callSid, "turn_received", transcript);
+    logStep(callSid, "turn_received", safeTextPreview(transcript));
 
     enqueueAudio(callSid, randomPick(FILLERS), "filler", turnId);
     pumpAudioQueue(callSid).catch(console.error);
 
-    startAssistantResponse(callSid, transcript, turnId).catch(console.error);
+    startAssistantResponse(callSid, transcript, turnId).catch((err) => {
+      console.error("startAssistantResponse error:", err.message);
+      if (calls.has(callSid)) {
+        const current = calls.get(callSid);
+        if (current && current.currentTurnId === turnId) {
+          current.generationDone = true;
+        }
+      }
+    });
 
     res.json({ ok: true, turnId });
   } catch (err) {
     console.error("/voice/turn-ended error:", err.message);
     res.status(500).json({ error: "Internal server error" });
   }
+});
+
+app.post("/voice/status", (req, res) => {
+  const callSid = req.body.CallSid;
+  const callStatus = req.body.CallStatus;
+
+  if (callSid) {
+    const state = getCallState(callSid);
+    state.currentCallStatus = callStatus || state.currentCallStatus;
+    logStep(callSid, "status_callback", callStatus || "unknown");
+
+    if (["completed", "busy", "failed", "no-answer", "canceled"].includes(callStatus)) {
+      cleanupCall(callSid);
+    }
+  }
+
+  res.sendStatus(200);
 });
 
 app.post("/voice/call-ended", (req, res) => {
