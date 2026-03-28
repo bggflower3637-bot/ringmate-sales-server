@@ -1,6 +1,9 @@
 import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
 
 const app = express();
 
@@ -12,6 +15,18 @@ const openai = new OpenAI({
 });
 
 const PORT = process.env.PORT || 10000;
+const BASE_URL = process.env.BASE_URL; // 예: https://ringmate-sales-server.onrender.com
+
+if (!BASE_URL) {
+  console.warn("Missing BASE_URL environment variable.");
+}
+
+// ------------------------
+// Static audio folder
+// ------------------------
+const AUDIO_DIR = path.join(process.cwd(), "public", "audio");
+fs.mkdirSync(AUDIO_DIR, { recursive: true });
+app.use("/audio", express.static(AUDIO_DIR));
 
 // ------------------------
 // Helpers
@@ -32,25 +47,24 @@ ${body}
 </Response>`;
 }
 
-function gatherTwiml(message, action = "/voice/respond") {
+function playAndGatherTwiml(audioUrl, action = "/voice/respond") {
   return twimlResponse(`
-  <Gather input="speech" speechTimeout="auto" action="${action}" method="POST" language="en-US">
-    <Say>${escapeXml(message)}</Say>
-  </Gather>
+  <Play>${escapeXml(audioUrl)}</Play>
+  <Gather input="speech" speechTimeout="auto" action="${action}" method="POST" language="en-US" />
   <Redirect method="POST">${action}</Redirect>
 `);
 }
 
-function sayHangupTwiml(message) {
+function playAndHangupTwiml(audioUrl) {
   return twimlResponse(`
-  <Say>${escapeXml(message)}</Say>
+  <Play>${escapeXml(audioUrl)}</Play>
   <Hangup/>
 `);
 }
 
-function sayDialTwiml(message, number) {
+function playAndDialTwiml(audioUrl, number) {
   return twimlResponse(`
-  <Say>${escapeXml(message)}</Say>
+  <Play>${escapeXml(audioUrl)}</Play>
   <Dial>${escapeXml(number)}</Dial>
 `);
 }
@@ -63,8 +77,64 @@ function includesAny(text, patterns = []) {
   return patterns.some((p) => text.includes(p));
 }
 
+function hashText(text = "") {
+  return crypto.createHash("md5").update(text).digest("hex");
+}
+
 // ------------------------
-// Simple in-memory session
+// ElevenLabs TTS
+// ------------------------
+async function synthesizeSpeech(text) {
+  const voiceId = process.env.ELEVENLABS_VOICE_ID;
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+
+  if (!voiceId || !apiKey) {
+    throw new Error("Missing ELEVENLABS_VOICE_ID or ELEVENLABS_API_KEY");
+  }
+
+  const fileName = `${hashText(text)}.mp3`;
+  const filePath = path.join(AUDIO_DIR, fileName);
+  const publicUrl = `${BASE_URL}/audio/${fileName}`;
+
+  if (fs.existsSync(filePath)) {
+    return publicUrl;
+  }
+
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5",
+        voice_settings: {
+          stability: Number(process.env.ELEVENLABS_STABILITY || 0.55),
+          similarity_boost: Number(process.env.ELEVENLABS_SIMILARITY || 0.75),
+          style: Number(process.env.ELEVENLABS_STYLE || 0.04),
+          use_speaker_boost: true,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`ElevenLabs error: ${response.status} ${errorText}`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
+
+  return publicUrl;
+}
+
+// ------------------------
+// Session store
 // ------------------------
 const sessions = new Map();
 
@@ -183,7 +253,7 @@ function detectIntent(text = "") {
 }
 
 // ------------------------
-// Script messages
+// Messages
 // ------------------------
 const MSG = {
   opening:
@@ -221,16 +291,28 @@ app.get("/", (_req, res) => {
   res.send("Ringmate Sales AI Engine Running");
 });
 
-// Twilio keeps calling this URL already
-app.post("/voice/incoming", (req, res) => {
-  const callSid = req.body.CallSid || `call_${Date.now()}`;
-  const session = getSession(callSid);
+app.post("/voice/incoming", async (req, res) => {
+  try {
+    const callSid = req.body.CallSid || `call_${Date.now()}`;
+    const session = getSession(callSid);
 
-  session.stage = "permission";
-  saveTurn(session, "assistant", MSG.opening);
+    session.stage = "permission";
+    saveTurn(session, "assistant", MSG.opening);
 
-  res.type("text/xml");
-  res.send(gatherTwiml(MSG.opening, "/voice/respond"));
+    const audioUrl = await synthesizeSpeech(MSG.opening);
+
+    res.type("text/xml");
+    return res.send(playAndGatherTwiml(audioUrl, "/voice/respond"));
+  } catch (error) {
+    console.error("Error in /voice/incoming:", error);
+    res.type("text/xml");
+    return res.send(
+      twimlResponse(`
+        <Say>Sorry, something went wrong.</Say>
+        <Hangup/>
+      `)
+    );
+  }
 });
 
 app.post("/voice/respond", async (req, res) => {
@@ -244,33 +326,34 @@ app.post("/voice/respond", async (req, res) => {
     const intent = detectIntent(speechText);
     const humanNumber = process.env.HUMAN_FORWARD_NUMBER || "+15555555555";
 
-    // 1) hard exits
     if (intent === "reject") {
       saveTurn(session, "assistant", MSG.reject);
+      const audioUrl = await synthesizeSpeech(MSG.reject);
       res.type("text/xml");
-      return res.send(sayHangupTwiml(MSG.reject));
+      return res.send(playAndHangupTwiml(audioUrl));
     }
 
     if (intent === "busy") {
       saveTurn(session, "assistant", MSG.busy);
+      const audioUrl = await synthesizeSpeech(MSG.busy);
       res.type("text/xml");
-      return res.send(sayHangupTwiml(MSG.busy));
+      return res.send(playAndHangupTwiml(audioUrl));
     }
 
-    // 2) direct handoff cases
     if (intent === "deep_question") {
       saveTurn(session, "assistant", MSG.handoff);
+      const audioUrl = await synthesizeSpeech(MSG.handoff);
       res.type("text/xml");
-      return res.send(sayDialTwiml(MSG.handoff, humanNumber));
+      return res.send(playAndDialTwiml(audioUrl, humanNumber));
     }
 
     if (intent === "interest" && session.questionAsked) {
       saveTurn(session, "assistant", MSG.interestedHandoff);
+      const audioUrl = await synthesizeSpeech(MSG.interestedHandoff);
       res.type("text/xml");
-      return res.send(sayDialTwiml(MSG.interestedHandoff, humanNumber));
+      return res.send(playAndDialTwiml(audioUrl, humanNumber));
     }
 
-    // 3) "What is this about?"
     if (intent === "why_calling") {
       session.stage = "question_1";
       session.questionAsked = true;
@@ -278,19 +361,20 @@ app.post("/voice/respond", async (req, res) => {
       const message = `${MSG.whyCalling} ${MSG.firstQuestion}`;
       saveTurn(session, "assistant", message);
 
+      const audioUrl = await synthesizeSpeech(message);
       res.type("text/xml");
-      return res.send(gatherTwiml(message, "/voice/respond"));
+      return res.send(playAndGatherTwiml(audioUrl, "/voice/respond"));
     }
 
-    // 4) stage flow
     if (session.stage === "permission") {
       session.stage = "question_1";
       session.questionAsked = true;
 
       saveTurn(session, "assistant", MSG.firstQuestion);
 
+      const audioUrl = await synthesizeSpeech(MSG.firstQuestion);
       res.type("text/xml");
-      return res.send(gatherTwiml(MSG.firstQuestion, "/voice/respond"));
+      return res.send(playAndGatherTwiml(audioUrl, "/voice/respond"));
     }
 
     if (session.stage === "question_1") {
@@ -299,43 +383,44 @@ app.post("/voice/respond", async (req, res) => {
 
       saveTurn(session, "assistant", MSG.secondQuestion);
 
+      const audioUrl = await synthesizeSpeech(MSG.secondQuestion);
       res.type("text/xml");
-      return res.send(gatherTwiml(MSG.secondQuestion, "/voice/respond"));
+      return res.send(playAndGatherTwiml(audioUrl, "/voice/respond"));
     }
 
-    // After second question:
-    // - 관심이면 handoff
-    // - 애매하면 GPT 짧은 답변 후 다시 넘김 방향
     if (session.stage === "question_2") {
       if (intent === "interest" || intent === "self_handle") {
         saveTurn(session, "assistant", MSG.interestedHandoff);
+        const audioUrl = await synthesizeSpeech(MSG.interestedHandoff);
         res.type("text/xml");
-        return res.send(sayDialTwiml(MSG.interestedHandoff, humanNumber));
+        return res.send(playAndDialTwiml(audioUrl, humanNumber));
       }
 
-      // 짧은 fallback GPT
       const aiReply = await generateShortReply(speechText);
       saveTurn(session, "assistant", aiReply);
 
+      const audioUrl = await synthesizeSpeech(aiReply);
       res.type("text/xml");
-      return res.send(gatherTwiml(aiReply, "/voice/respond"));
+      return res.send(playAndGatherTwiml(audioUrl, "/voice/respond"));
     }
 
-    // Fallback
     saveTurn(session, "assistant", MSG.fallback);
-    res.type("text/xml");
-    return res.send(gatherTwiml(MSG.fallback, "/voice/respond"));
-  } catch (error) {
-    console.error("Error in /voice/respond:", error);
+    const audioUrl = await synthesizeSpeech(MSG.fallback);
 
     res.type("text/xml");
+    return res.send(playAndGatherTwiml(audioUrl, "/voice/respond"));
+  } catch (error) {
+    console.error("Error in /voice/respond:", error);
+    res.type("text/xml");
     return res.send(
-      sayHangupTwiml("Sorry about that — we’ll follow up another time.")
+      twimlResponse(`
+        <Say>Sorry about that. We'll follow up another time.</Say>
+        <Hangup/>
+      `)
     );
   }
 });
 
-// Optional debug
 app.get("/debug/session/:callSid", (req, res) => {
   const session = sessions.get(req.params.callSid);
   if (!session) {
