@@ -3,143 +3,19 @@ import bodyParser from "body-parser";
 import OpenAI from "openai";
 
 const app = express();
+
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL || "https://your-render-service.onrender.com";
+const PORT = process.env.PORT || 10000;
 
-// --------------------------------------------------
-// In-memory session store
-// Replace with Redis / DB in production
-// --------------------------------------------------
-const sessions = new Map();
-
-function getSession(callSid) {
-  if (!sessions.has(callSid)) {
-    sessions.set(callSid, {
-      stage: "opening",
-      questionCount: 0,
-      lastIntent: null,
-      interestLevel: null,
-      result: null,
-      transcript: []
-    });
-  }
-  return sessions.get(callSid);
-}
-
-function saveTurn(session, speaker, text) {
-  session.transcript.push({ speaker, text, at: new Date().toISOString() });
-}
-
-function normalize(text = "") {
-  return text.toLowerCase().trim();
-}
-
-function detectIntent(text = "") {
-  const t = normalize(text);
-
-  const deepQuestionPatterns = [
-    /how much/,
-    /price/,
-    /pricing/,
-    /cost/,
-    /how does it work/,
-    /how do(es)? this work/,
-    /details/,
-    /what exactly/,
-    /can you explain/
-  ];
-
-  const interestPatterns = [
-    /yes/,
-    /yeah/,
-    /maybe/,
-    /sounds good/,
-    /okay/,
-    /ok/,
-    /interested/,
-    /tell me more/
-  ];
-
-  const rejectPatterns = [
-    /not interested/,
-    /nope/,
-    /^no$/,
-    /stop calling/,
-    /remove me/,
-    /don'?t call/,
-    /not now/
-  ];
-
-  const busyPatterns = [
-    /busy/,
-    /call me later/,
-    /not a good time/,
-    /in a meeting/,
-    /can't talk/,
-    /cant talk/
-  ];
-
-  const whyPatterns = [
-    /what is this about/,
-    /what'?s this about/,
-    /why are you calling/,
-    /what do you want/,
-    /who is this/
-  ];
-
-  const languagePatterns = [
-    /i don't speak english/,
-    /no english/,
-    /english is not good/
-  ];
-
-  if (languagePatterns.some((r) => r.test(t))) return "language";
-  if (busyPatterns.some((r) => r.test(t))) return "busy";
-  if (rejectPatterns.some((r) => r.test(t))) return "reject";
-  if (deepQuestionPatterns.some((r) => r.test(t))) return "deep_question";
-  if (whyPatterns.some((r) => r.test(t))) return "why_calling";
-  if (interestPatterns.some((r) => r.test(t))) return "interest";
-
-  return "general";
-}
-
-function filler() {
-  const list = ["Yeah—", "Got it—", "Right—", "I see—", "Hmm—"];
-  return list[Math.floor(Math.random() * list.length)];
-}
-
-function twimlSayAndGather({ message, action = "/voice/respond", voice = "Polly.Joanna" }) {
-  // Twilio <Gather input="speech"> pattern
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Gather input="speech" speechTimeout="auto" action="${action}" method="POST" language="en-US">
-    <Say voice="${voice}">${escapeXml(message)}</Say>
-  </Gather>
-  <Redirect method="POST">/voice/respond</Redirect>
-</Response>`;
-}
-
-function twimlSayAndHangup({ message, voice = "Polly.Joanna" }) {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="${voice}">${escapeXml(message)}</Say>
-  <Hangup/>
-</Response>`;
-}
-
-function twimlConnectHuman({ phoneNumber }) {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Joanna">One quick second — I’ll connect you now.</Say>
-  <Dial>${escapeXml(phoneNumber)}</Dial>
-</Response>`;
-}
-
+// ------------------------
+// Helpers
+// ------------------------
 function escapeXml(str = "") {
   return str
     .replace(/&/g, "&amp;")
@@ -149,247 +25,368 @@ function escapeXml(str = "") {
     .replace(/'/g, "&apos;");
 }
 
-async function generateShortReply({ userText, session }) {
-  const system = `
-You are Ryan from Ringmate.
-You are a calm, confident, experienced male sales rep.
+function twimlResponse(body) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+${body}
+</Response>`;
+}
 
-Your job:
-- sound natural and human
-- keep replies short
-- create curiosity
-- never deeply explain
-- if the user is interested or asks detailed questions, move toward handoff
+function gatherTwiml(message, action = "/voice/respond") {
+  return twimlResponse(`
+  <Gather input="speech" speechTimeout="auto" action="${action}" method="POST" language="en-US">
+    <Say>${escapeXml(message)}</Say>
+  </Gather>
+  <Redirect method="POST">${action}</Redirect>
+`);
+}
 
-Rules:
-- Always start naturally, like a real person.
-- Keep it to 1 or 2 short sentences.
-- No long explanations.
-- No pushy tone.
-- If the conversation is unclear, respond briefly and move back toward either:
-  1) a simple qualifying question, or
-  2) a polite handoff.
+function sayHangupTwiml(message) {
+  return twimlResponse(`
+  <Say>${escapeXml(message)}</Say>
+  <Hangup/>
+`);
+}
 
-Context:
-- Ringmate helps businesses catch missed calls and turn them into bookings.
-- This is a cold outbound call.
-- The caller should sound polite, calm, and not robotic.
-- The conversation should feel like a human talking, not a script being read.
+function sayDialTwiml(message, number) {
+  return twimlResponse(`
+  <Say>${escapeXml(message)}</Say>
+  <Dial>${escapeXml(number)}</Dial>
+`);
+}
 
-Current stage: ${session.stage}
-Question count so far: ${session.questionCount}
-`;
+function normalize(text = "") {
+  return text.toLowerCase().trim();
+}
 
-  const user = `Customer said: "${userText}"
+function includesAny(text, patterns = []) {
+  return patterns.some((p) => text.includes(p));
+}
 
-Write Ryan's next reply only.`;
+// ------------------------
+// Simple in-memory session
+// ------------------------
+const sessions = new Map();
 
-  const response = await openai.responses.create({
-    model: process.env.OPENAI_MODEL || "gpt-5-mini",
-    input: [
-      { role: "system", content: system },
-      { role: "user", content: user }
-    ],
-    max_output_tokens: 80
+function getSession(callSid) {
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, {
+      stage: "opening",
+      transcript: [],
+      questionAsked: false,
+      secondQuestionAsked: false,
+    });
+  }
+  return sessions.get(callSid);
+}
+
+function saveTurn(session, speaker, text) {
+  session.transcript.push({
+    speaker,
+    text,
+    at: new Date().toISOString(),
   });
-
-  return (response.output_text || `${filler()} got it.`).trim();
 }
 
-function openingMessage() {
-  return [
-    "Hi — this is Ryan with Ringmate.",
-    "We work with local businesses around call handling.",
-    "Do you have a quick second?"
-  ].join(" ");
+// ------------------------
+// Intent detection
+// ------------------------
+function detectIntent(text = "") {
+  const t = normalize(text);
+
+  if (
+    includesAny(t, [
+      "not interested",
+      "no thanks",
+      "stop calling",
+      "remove me",
+      "don't call",
+      "do not call",
+    ]) ||
+    t === "no"
+  ) {
+    return "reject";
+  }
+
+  if (
+    includesAny(t, [
+      "busy",
+      "call me later",
+      "not a good time",
+      "in a meeting",
+      "can't talk",
+      "cant talk",
+      "later",
+    ])
+  ) {
+    return "busy";
+  }
+
+  if (
+    includesAny(t, [
+      "what is this",
+      "what's this",
+      "what is this about",
+      "what's this about",
+      "why are you calling",
+      "what do you want",
+      "who is this",
+    ])
+  ) {
+    return "why_calling";
+  }
+
+  if (
+    includesAny(t, [
+      "price",
+      "pricing",
+      "cost",
+      "how much",
+      "how does it work",
+      "how do you work",
+      "details",
+      "can you explain",
+      "tell me more about it",
+    ])
+  ) {
+    return "deep_question";
+  }
+
+  if (
+    includesAny(t, [
+      "yes",
+      "yeah",
+      "sure",
+      "okay",
+      "ok",
+      "maybe",
+      "sounds good",
+      "interested",
+    ])
+  ) {
+    return "interest";
+  }
+
+  if (
+    includesAny(t, [
+      "i handle them myself",
+      "we handle them ourselves",
+      "manually",
+      "myself",
+      "ourselves",
+    ])
+  ) {
+    return "self_handle";
+  }
+
+  return "general";
 }
 
-function firstQuestionMessage() {
-  return [
-    "Got it — appreciate it.",
-    "Quick question — are you currently handling calls yourself right now?"
-  ].join(" ");
-}
+// ------------------------
+// Script messages
+// ------------------------
+const MSG = {
+  opening:
+    "Hi — this is Ryan with Ringmate. We work with local businesses around call handling. Do you have a quick second?",
 
-function secondQuestionMessage() {
-  return [
-    `${filler()} got it.`,
-    "Do you ever miss calls when things get busy?"
-  ].join(" ");
-}
+  firstQuestion:
+    "Got it — appreciate it. Quick question — are you currently handling calls yourself right now?",
 
-function whyCallingMessage() {
-  return [
-    "Yeah — absolutely.",
-    "We help businesses catch missed calls and turn them into bookings.",
-    "Just wanted to see if that’s something you might need."
-  ].join(" ");
-}
+  secondQuestion:
+    "Yeah — got it. Do you ever miss calls when things get busy?",
 
-function handoffMessage() {
-  return [
-    `${filler()} great question.`,
-    "This is probably easier if someone on our team walks you through it properly.",
-    "Let me connect you real quick."
-  ].join(" ");
-}
+  whyCalling:
+    "Yeah — absolutely. We help businesses catch missed calls and turn them into bookings. Just wanted to see if that’s something you might need.",
 
-function followUpMessage() {
-  return [
-    "Got it — totally understand.",
-    "We can follow up another time that works better for you."
-  ].join(" ");
-}
+  handoff:
+    "Got it — great question. This is probably easier if someone on our team walks you through it properly. Let me connect you real quick.",
 
-function rejectMessage() {
-  return [
-    "No worries at all.",
-    "If anything changes down the line, feel free to reach out.",
-    "Appreciate your time — have a great day."
-  ].join(" ");
-}
+  interestedHandoff:
+    "Yeah — got it. Honestly, this is probably easier if someone on our team walks you through it properly. Let me connect you real quick.",
 
-function languageMessage() {
-  return [
-    "No problem at all.",
-    "We can follow up by text instead."
-  ].join(" ");
-}
+  reject:
+    "No worries at all. If anything changes down the line, feel free to reach out. Appreciate your time — have a great day.",
 
-// --------------------------------------------------
-// 1) Incoming call entrypoint
-// --------------------------------------------------
-app.post("/voice", (req, res) => {
-  const callSid = req.body.CallSid;
+  busy:
+    "Got it — totally understand. We can follow up another time that works better for you.",
+
+  fallback:
+    "Yeah — got it. Quick question — are you currently handling calls yourself right now?",
+};
+
+// ------------------------
+// Routes
+// ------------------------
+app.get("/", (_req, res) => {
+  res.send("Ringmate Sales AI Engine Running");
+});
+
+// Twilio keeps calling this URL already
+app.post("/voice/incoming", (req, res) => {
+  const callSid = req.body.CallSid || `call_${Date.now()}`;
   const session = getSession(callSid);
 
   session.stage = "permission";
-  saveTurn(session, "assistant", openingMessage());
+  saveTurn(session, "assistant", MSG.opening);
 
-  res.type("text/xml").send(
-    twimlSayAndGather({
-      message: openingMessage(),
-      action: "/voice/respond"
-    })
-  );
+  res.type("text/xml");
+  res.send(gatherTwiml(MSG.opening, "/voice/respond"));
 });
 
-// --------------------------------------------------
-// 2) Speech response handler
-// --------------------------------------------------
 app.post("/voice/respond", async (req, res) => {
   try {
-    const callSid = req.body.CallSid;
+    const callSid = req.body.CallSid || `call_${Date.now()}`;
     const speechText = req.body.SpeechResult || "";
     const session = getSession(callSid);
 
     saveTurn(session, "user", speechText);
 
     const intent = detectIntent(speechText);
-    session.lastIntent = intent;
+    const humanNumber = process.env.HUMAN_FORWARD_NUMBER || "+15555555555";
 
-    // Stage-driven handling
+    // 1) hard exits
     if (intent === "reject") {
-      session.result = "rejected";
-      saveTurn(session, "assistant", rejectMessage());
-      return res.type("text/xml").send(twimlSayAndHangup({ message: rejectMessage() }));
+      saveTurn(session, "assistant", MSG.reject);
+      res.type("text/xml");
+      return res.send(sayHangupTwiml(MSG.reject));
     }
 
     if (intent === "busy") {
-      session.result = "follow_up";
-      saveTurn(session, "assistant", followUpMessage());
-      return res.type("text/xml").send(twimlSayAndHangup({ message: followUpMessage() }));
+      saveTurn(session, "assistant", MSG.busy);
+      res.type("text/xml");
+      return res.send(sayHangupTwiml(MSG.busy));
     }
 
-    if (intent === "language") {
-      session.result = "follow_up_text";
-      saveTurn(session, "assistant", languageMessage());
-      return res.type("text/xml").send(twimlSayAndHangup({ message: languageMessage() }));
-    }
-
+    // 2) direct handoff cases
     if (intent === "deep_question") {
-      session.result = "transferred";
-      saveTurn(session, "assistant", handoffMessage());
-      return res.type("text/xml").send(twimlConnectHuman({ phoneNumber: process.env.HUMAN_FORWARD_NUMBER || "+15555555555" }));
+      saveTurn(session, "assistant", MSG.handoff);
+      res.type("text/xml");
+      return res.send(sayDialTwiml(MSG.handoff, humanNumber));
     }
 
-    if (intent === "interest") {
-      session.interestLevel = "yes_or_maybe";
-      session.result = "transferred";
-      saveTurn(session, "assistant", handoffMessage());
-      return res.type("text/xml").send(twimlConnectHuman({ phoneNumber: process.env.HUMAN_FORWARD_NUMBER || "+15555555555" }));
+    if (intent === "interest" && session.questionAsked) {
+      saveTurn(session, "assistant", MSG.interestedHandoff);
+      res.type("text/xml");
+      return res.send(sayDialTwiml(MSG.interestedHandoff, humanNumber));
     }
 
+    // 3) "What is this about?"
     if (intent === "why_calling") {
-      session.stage = "explained_reason";
-      session.questionCount += 1;
-      const msg = `${whyCallingMessage()} ${firstQuestionMessage()}`;
-      saveTurn(session, "assistant", msg);
-      return res.type("text/xml").send(
-        twimlSayAndGather({ message: msg, action: "/voice/respond" })
-      );
+      session.stage = "question_1";
+      session.questionAsked = true;
+
+      const message = `${MSG.whyCalling} ${MSG.firstQuestion}`;
+      saveTurn(session, "assistant", message);
+
+      res.type("text/xml");
+      return res.send(gatherTwiml(message, "/voice/respond"));
     }
 
-    // Stage-based default flow
+    // 4) stage flow
     if (session.stage === "permission") {
       session.stage = "question_1";
-      session.questionCount += 1;
-      saveTurn(session, "assistant", firstQuestionMessage());
-      return res.type("text/xml").send(
-        twimlSayAndGather({ message: firstQuestionMessage(), action: "/voice/respond" })
-      );
+      session.questionAsked = true;
+
+      saveTurn(session, "assistant", MSG.firstQuestion);
+
+      res.type("text/xml");
+      return res.send(gatherTwiml(MSG.firstQuestion, "/voice/respond"));
     }
 
     if (session.stage === "question_1") {
       session.stage = "question_2";
-      session.questionCount += 1;
-      saveTurn(session, "assistant", secondQuestionMessage());
-      return res.type("text/xml").send(
-        twimlSayAndGather({ message: secondQuestionMessage(), action: "/voice/respond" })
-      );
+      session.secondQuestionAsked = true;
+
+      saveTurn(session, "assistant", MSG.secondQuestion);
+
+      res.type("text/xml");
+      return res.send(gatherTwiml(MSG.secondQuestion, "/voice/respond"));
     }
 
+    // After second question:
+    // - 관심이면 handoff
+    // - 애매하면 GPT 짧은 답변 후 다시 넘김 방향
     if (session.stage === "question_2") {
-      // After second question, any continued engagement gets handed off or gently ended.
-      const msg = await generateShortReply({ userText: speechText, session });
-      saveTurn(session, "assistant", msg);
+      if (intent === "interest" || intent === "self_handle") {
+        saveTurn(session, "assistant", MSG.interestedHandoff);
+        res.type("text/xml");
+        return res.send(sayDialTwiml(MSG.interestedHandoff, humanNumber));
+      }
 
-      return res.type("text/xml").send(
-        twimlSayAndGather({ message: msg, action: "/voice/respond" })
-      );
+      // 짧은 fallback GPT
+      const aiReply = await generateShortReply(speechText);
+      saveTurn(session, "assistant", aiReply);
+
+      res.type("text/xml");
+      return res.send(gatherTwiml(aiReply, "/voice/respond"));
     }
 
     // Fallback
-    const fallback = await generateShortReply({ userText: speechText, session });
-    saveTurn(session, "assistant", fallback);
-
-    return res.type("text/xml").send(
-      twimlSayAndGather({ message: fallback, action: "/voice/respond" })
-    );
+    saveTurn(session, "assistant", MSG.fallback);
+    res.type("text/xml");
+    return res.send(gatherTwiml(MSG.fallback, "/voice/respond"));
   } catch (error) {
-    console.error("/voice/respond error:", error);
-    return res.type("text/xml").send(
-      twimlSayAndHangup({
-        message: "Sorry about that — we’ll follow up another time."
-      })
+    console.error("Error in /voice/respond:", error);
+
+    res.type("text/xml");
+    return res.send(
+      sayHangupTwiml("Sorry about that — we’ll follow up another time.")
     );
   }
 });
 
-// --------------------------------------------------
-// 3) Optional: inspect session logs
-// --------------------------------------------------
+// Optional debug
 app.get("/debug/session/:callSid", (req, res) => {
   const session = sessions.get(req.params.callSid);
-  if (!session) return res.status(404).json({ error: "Session not found" });
+  if (!session) {
+    return res.status(404).json({ error: "Session not found" });
+  }
   res.json(session);
 });
 
-app.get("/", (_req, res) => {
-  res.send("Ringmate Sales AI Engine Running");
-});
+// ------------------------
+// GPT fallback
+// ------------------------
+async function generateShortReply(userText) {
+  try {
+    const response = await openai.responses.create({
+      model: process.env.OPENAI_MODEL || "gpt-5-mini",
+      input: [
+        {
+          role: "system",
+          content: `
+You are Ryan from Ringmate.
+You are a calm, experienced male representative.
+
+Rules:
+- Keep replies very short.
+- Sound natural and human.
+- Do not explain deeply.
+- Move the conversation toward either:
+  1) a simple qualifying question, or
+  2) handing off to a human.
+- Max 2 short sentences.
+          `.trim(),
+        },
+        {
+          role: "user",
+          content: `Customer said: "${userText}"
+Write Ryan's next reply only.`,
+        },
+      ],
+      max_output_tokens: 60,
+    });
+
+    const text = response.output_text?.trim();
+    if (text) return text;
+
+    return "Yeah — got it. Let me connect you real quick.";
+  } catch (err) {
+    console.error("OpenAI error:", err);
+    return "Yeah — got it. Let me connect you real quick.";
+  }
+}
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Base URL: ${BASE_URL}`);
 });
