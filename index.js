@@ -1,595 +1,395 @@
 import express from "express";
-import axios from "axios";
+import bodyParser from "body-parser";
 import OpenAI from "openai";
 
 const app = express();
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const PORT = process.env.PORT || 3000;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const VOICE_ID = process.env.VOICE_ID;
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const BASE_URL = process.env.BASE_URL || "https://your-render-service.onrender.com";
 
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-});
+// --------------------------------------------------
+// In-memory session store
+// Replace with Redis / DB in production
+// --------------------------------------------------
+const sessions = new Map();
 
-const audioStore = new Map();
-
-// -----------------------------
-// ElevenLabs TTS
-// -----------------------------
-async function generateSpeech(text) {
-  const response = await axios({
-    method: "POST",
-    url: `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
-    headers: {
-      "xi-api-key": ELEVENLABS_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "audio/mpeg",
-    },
-    data: {
-      text,
-      model_id: "eleven_turbo_v2",
-      voice_settings: {
-        stability: 0.55,
-        similarity_boost: 0.75,
-        style: 0.04,
-        use_speaker_boost: true,
-      },
-    },
-    responseType: "arraybuffer",
-  });
-
-  return Buffer.from(response.data);
+function getSession(callSid) {
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, {
+      stage: "opening",
+      questionCount: 0,
+      lastIntent: null,
+      interestLevel: null,
+      result: null,
+      transcript: []
+    });
+  }
+  return sessions.get(callSid);
 }
 
-// -----------------------------
-// Audio store
-// -----------------------------
-function saveAudio(id, buffer) {
-  audioStore.set(id, buffer);
-
-  setTimeout(() => {
-    audioStore.delete(id);
-  }, 10 * 60 * 1000);
+function saveTurn(session, speaker, text) {
+  session.transcript.push({ speaker, text, at: new Date().toISOString() });
 }
 
-async function createSingleAudioUrl(text) {
-  const buffer = await generateSpeech(text);
-  const id = `audio-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
-  saveAudio(id, buffer);
-  return `${PUBLIC_BASE_URL}/audio/${id}`;
-}
-
-// -----------------------------
-// TwiML helpers
-// -----------------------------
-function buildGatherTwiml(audioUrl, nextStep) {
-  return `
-<Response>
-  <Play>${audioUrl}</Play>
-  <Gather
-    input="speech"
-    speechTimeout="auto"
-    action="${PUBLIC_BASE_URL}/voice/process?step=${nextStep}"
-    method="POST"
-    actionOnEmptyResult="true"
-  />
-  <Redirect method="POST">${PUBLIC_BASE_URL}/voice/process?step=${nextStep}</Redirect>
-</Response>`;
-}
-
-function buildHangupTwiml(audioUrl) {
-  return `
-<Response>
-  <Play>${audioUrl}</Play>
-  <Hangup />
-</Response>`;
-}
-
-async function respondAndHangup(text, res) {
-  const audioUrl = await createSingleAudioUrl(text);
-  const twiml = buildHangupTwiml(audioUrl);
-
-  res.set("Content-Type", "text/xml");
-  return res.send(twiml);
-}
-
-async function respondAndContinue(text, nextStep, res) {
-  const audioUrl = await createSingleAudioUrl(text);
-  const twiml = buildGatherTwiml(audioUrl, nextStep);
-
-  res.set("Content-Type", "text/xml");
-  return res.send(twiml);
-}
-
-// -----------------------------
-// Fixed text blocks
-// -----------------------------
-function getWarmupText() {
-  return [
-    "Hi — this is Emily with Ringmate.",
-    "We help businesses handle missed calls and turn them into bookings.",
-    "Hope you're having a good day so far.",
-  ].join(" ");
-}
-
-function getSimpleQuestionAnswer() {
-  return [
-    "Yeah — absolutely.",
-    "We help businesses catch missed calls and turn them into bookings.",
-  ].join(" ");
-}
-
-function getDeepQuestionHandoffText() {
-  return [
-    "Got it — great question.",
-    "One of our team members can walk you through that in more detail.",
-    "They’ll reach out shortly.",
-  ].join(" ");
-}
-
-function getInterestedHandoffText() {
-  return [
-    "That makes sense.",
-    "I’ll have someone from our team reach out and walk you through it.",
-    "Really appreciate your time today.",
-  ].join(" ");
-}
-
-function getNotInterestedClosingText() {
-  return [
-    "No worries at all.",
-    "Thanks for taking the call.",
-    "Have a great rest of your day.",
-  ].join(" ");
-}
-
-function getSoftClosingText() {
-  return [
-    "Totally understand.",
-    "If it ever becomes a problem, we'd be happy to help.",
-    "Really appreciate your time today.",
-  ].join(" ");
-}
-
-function getLanguageHandoffText() {
-  return [
-    "No problem at all.",
-    "I can have someone follow up with you by text instead.",
-    "Really appreciate your time.",
-  ].join(" ");
-}
-
-function getBusyHandoffText() {
-  return [
-    "Totally understand.",
-    "I’ll have someone reach out at a better time.",
-    "Really appreciate it.",
-  ].join(" ");
-}
-
-function getTrustHandoffText() {
-  return [
-    "Yeah — totally fair.",
-    "We work with local businesses to help with missed calls.",
-    "I can have someone follow up and explain everything.",
-  ].join(" ");
-}
-
-// -----------------------------
-// Detection helpers
-// -----------------------------
-function normalizeText(text = "") {
+function normalize(text = "") {
   return text.toLowerCase().trim();
 }
 
-function isSimpleQuestion(text = "") {
-  const t = normalizeText(text);
-
-  return (
-    t.includes("what is this") ||
-    t.includes("what's this") ||
-    t.includes("what is this about") ||
-    t.includes("what's this about") ||
-    t.includes("what do you do") ||
-    t.includes("who is this") ||
-    t.includes("why are you calling") ||
-    t.includes("what is ringmate") ||
-    t === "what is this" ||
-    t === "who is this" ||
-    t === "why are you calling"
-  );
-}
-
-function isDeepQuestion(text = "") {
-  const t = normalizeText(text);
-
-  return (
-    t.includes("how does it work") ||
-    t.includes("how exactly") ||
-    t.includes("how much") ||
-    t.includes("price") ||
-    t.includes("cost") ||
-    t.includes("features") ||
-    t.includes("difference") ||
-    t.includes("compare") ||
-    t.includes("integration") ||
-    t.includes("setup") ||
-    t.includes("what does it cost")
-  );
-}
-
 function detectIntent(text = "") {
-  const t = normalizeText(text);
+  const t = normalize(text);
 
-  if (!t) return "empty";
+  const deepQuestionPatterns = [
+    /how much/,
+    /price/,
+    /pricing/,
+    /cost/,
+    /how does it work/,
+    /how do(es)? this work/,
+    /details/,
+    /what exactly/,
+    /can you explain/
+  ];
 
-  if (
-    t.includes("not interested") ||
-    t.includes("no thanks") ||
-    t.includes("we're good") ||
-    t.includes("we are good") ||
-    t.includes("don't need") ||
-    t.includes("do not need") ||
-    t.includes("nope") ||
-    t.includes("not really")
-  ) {
-    return "negative";
-  }
+  const interestPatterns = [
+    /yes/,
+    /yeah/,
+    /maybe/,
+    /sounds good/,
+    /okay/,
+    /ok/,
+    /interested/,
+    /tell me more/
+  ];
 
-  if (
-    t.includes("sometimes") ||
-    t.includes("busy") ||
-    t.includes("miss calls") ||
-    t.includes("missed calls") ||
-    t.includes("too many calls") ||
-    t.includes("can't answer") ||
-    t.includes("cannot answer") ||
-    t.includes("hard to keep up")
-  ) {
-    return "pain";
-  }
+  const rejectPatterns = [
+    /not interested/,
+    /nope/,
+    /^no$/,
+    /stop calling/,
+    /remove me/,
+    /don'?t call/,
+    /not now/
+  ];
 
-  if (
-    t.includes("yeah") ||
-    t.includes("yes") ||
-    t.includes("sure") ||
-    t.includes("okay") ||
-    t.includes("ok") ||
-    t.includes("maybe") ||
-    t.includes("possibly") ||
-    t.includes("interested") ||
-    t.includes("sounds good") ||
-    t.includes("that works")
-  ) {
-    return "positive";
-  }
+  const busyPatterns = [
+    /busy/,
+    /call me later/,
+    /not a good time/,
+    /in a meeting/,
+    /can't talk/,
+    /cant talk/
+  ];
 
-  return "neutral";
+  const whyPatterns = [
+    /what is this about/,
+    /what'?s this about/,
+    /why are you calling/,
+    /what do you want/,
+    /who is this/
+  ];
+
+  const languagePatterns = [
+    /i don't speak english/,
+    /no english/,
+    /english is not good/
+  ];
+
+  if (languagePatterns.some((r) => r.test(t))) return "language";
+  if (busyPatterns.some((r) => r.test(t))) return "busy";
+  if (rejectPatterns.some((r) => r.test(t))) return "reject";
+  if (deepQuestionPatterns.some((r) => r.test(t))) return "deep_question";
+  if (whyPatterns.some((r) => r.test(t))) return "why_calling";
+  if (interestPatterns.some((r) => r.test(t))) return "interest";
+
+  return "general";
 }
 
-function soundsInterested(text = "") {
-  const t = normalizeText(text);
-
-  return (
-    t.includes("yes") ||
-    t.includes("yeah") ||
-    t.includes("sure") ||
-    t.includes("okay") ||
-    t.includes("ok") ||
-    t.includes("interested") ||
-    t.includes("open to that") ||
-    t.includes("open to it") ||
-    t.includes("sounds good") ||
-    t.includes("that works") ||
-    t.includes("maybe")
-  );
+function filler() {
+  const list = ["Yeah—", "Got it—", "Right—", "I see—", "Hmm—"];
+  return list[Math.floor(Math.random() * list.length)];
 }
 
-function detectSpecialCase(text = "") {
-  const t = normalizeText(text);
-
-  if (
-    t.includes("can't speak english") ||
-    t.includes("cannot speak english") ||
-    t.includes("don't speak english") ||
-    t.includes("do not speak english") ||
-    t.includes("not good at english") ||
-    t.includes("i don't understand english") ||
-    t.includes("i do not understand english") ||
-    t.includes("hard to understand")
-  ) {
-    return "language";
-  }
-
-  if (
-    t.includes("i'm busy") ||
-    t.includes("i am busy") ||
-    t.includes("busy right now") ||
-    t.includes("call later") ||
-    t.includes("not now") ||
-    t.includes("can you call back")
-  ) {
-    return "busy";
-  }
-
-  if (
-    t.includes("who gave you this number") ||
-    t.includes("where did you get my number") ||
-    t.includes("how did you get my number")
-  ) {
-    return "trust";
-  }
-
-  return null;
+function twimlSayAndGather({ message, action = "/voice/respond", voice = "Polly.Joanna" }) {
+  // Twilio <Gather input="speech"> pattern
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" speechTimeout="auto" action="${action}" method="POST" language="en-US">
+    <Say voice="${voice}">${escapeXml(message)}</Say>
+  </Gather>
+  <Redirect method="POST">/voice/respond</Redirect>
+</Response>`;
 }
 
-function pickRandom(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
+function twimlSayAndHangup({ message, voice = "Polly.Joanna" }) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="${voice}">${escapeXml(message)}</Say>
+  <Hangup/>
+</Response>`;
 }
 
-function getReaction(intent) {
-  const reactions = {
-    positive: ["Got it.", "Okay.", "Right."],
-    pain: ["Yeah — that happens.", "I hear you.", "Got it."],
-    negative: ["I see.", "Got it.", "Okay."],
-    neutral: ["Mm-hmm.", "I see.", "Gotcha."],
-    empty: ["Got it."],
-  };
-
-  return pickRandom(reactions[intent] || reactions.neutral);
+function twimlConnectHuman({ phoneNumber }) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna">One quick second — I’ll connect you now.</Say>
+  <Dial>${escapeXml(phoneNumber)}</Dial>
+</Response>`;
 }
 
-// -----------------------------
-// OpenAI core generation
-// -----------------------------
-async function generateShortReply(step, userText = "") {
-  const trimmedUserText = (userText || "").trim();
+function escapeXml(str = "") {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
-  if (!trimmedUserText) {
-    if (step === "intro") {
-      return "Just wanted to ask real quick — are you usually the one handling calls there?";
-    }
+async function generateShortReply({ userText, session }) {
+  const system = `
+You are Ryan from Ringmate.
+You are a calm, confident, experienced male sales rep.
 
-    if (step === "problem-check") {
-      return "Would you be open to learning a little more about something like this?";
-    }
-
-    return "Thanks again for your time.";
-  }
-
-  let stageInstruction = "";
-
-  if (step === "intro") {
-    stageInstruction = `
-Goal:
-- Move naturally into a short discovery question
+Your job:
+- sound natural and human
+- keep replies short
+- create curiosity
+- never deeply explain
+- if the user is interested or asks detailed questions, move toward handoff
 
 Rules:
-- Return only 1 or 2 short spoken sentences
-- Do not explain the company again
-- Do not mention AI
-- Do not mention pricing
-- Keep it conversational
-- End with one short question
+- Always start naturally, like a real person.
+- Keep it to 1 or 2 short sentences.
+- No long explanations.
+- No pushy tone.
+- If the conversation is unclear, respond briefly and move back toward either:
+  1) a simple qualifying question, or
+  2) a polite handoff.
+
+Context:
+- Ringmate helps businesses catch missed calls and turn them into bookings.
+- This is a cold outbound call.
+- The caller should sound polite, calm, and not robotic.
+- The conversation should feel like a human talking, not a script being read.
+
+Current stage: ${session.stage}
+Question count so far: ${session.questionCount}
 `;
-  } else if (step === "problem-check") {
-    stageInstruction = `
-Goal:
-- Briefly say Ringmate helps with missed calls and bookings
-- Ask whether they would be open to learning more
 
-Rules:
-- Return only 2 or 3 short spoken sentences
-- Keep it concise
-- No pricing
-- No technical explanation
-- No long pitch
-`;
-  } else {
-    stageInstruction = `
-Goal:
-- End politely
+  const user = `Customer said: "${userText}"
 
-Rules:
-- Return only 1 short spoken sentence
-- No extra pitch
-`;
-  }
+Write Ryan's next reply only.`;
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    temperature: 0.25,
-    max_tokens: 50,
-    messages: [
-      {
-        role: "system",
-        content: `
-You are Emily from Ringmate speaking on a phone call.
-
-Style rules:
-- Sound human, calm, and casual
-- Sound spoken, not written
-- Keep it short
-- Never ramble
-- Use simple natural phone language
-        `.trim(),
-      },
-      {
-        role: "system",
-        content: stageInstruction.trim(),
-      },
-      {
-        role: "user",
-        content: `The person said: "${trimmedUserText}"`,
-      },
+  const response = await openai.responses.create({
+    model: process.env.OPENAI_MODEL || "gpt-5-mini",
+    input: [
+      { role: "system", content: system },
+      { role: "user", content: user }
     ],
+    max_output_tokens: 80
   });
 
-  const text = response.choices?.[0]?.message?.content?.trim();
-
-  if (!text) {
-    if (step === "intro") {
-      return "Just wanted to ask real quick — are you usually the one handling calls there?";
-    }
-
-    if (step === "problem-check") {
-      return "Would you be open to learning a little more about something like this?";
-    }
-
-    return "Thanks again for your time.";
-  }
-
-  return text.replace(/\s+/g, " ").trim();
+  return (response.output_text || `${filler()} got it.`).trim();
 }
 
-async function generateReply(step, userText = "") {
-  const intent = detectIntent(userText);
-  const reaction = getReaction(intent);
-  const core = await generateShortReply(step, userText);
-
-  if (!core) return reaction;
-  return `${reaction} ${core}`.replace(/\s+/g, " ").trim();
+function openingMessage() {
+  return [
+    "Hi — this is Ryan with Ringmate.",
+    "We work with local businesses around call handling.",
+    "Do you have a quick second?"
+  ].join(" ");
 }
 
-// -----------------------------
-// Routes
-// -----------------------------
-app.get("/", (req, res) => {
-  res.send("Ringmate Sales AI Server Running");
+function firstQuestionMessage() {
+  return [
+    "Got it — appreciate it.",
+    "Quick question — are you currently handling calls yourself right now?"
+  ].join(" ");
+}
+
+function secondQuestionMessage() {
+  return [
+    `${filler()} got it.`,
+    "Do you ever miss calls when things get busy?"
+  ].join(" ");
+}
+
+function whyCallingMessage() {
+  return [
+    "Yeah — absolutely.",
+    "We help businesses catch missed calls and turn them into bookings.",
+    "Just wanted to see if that’s something you might need."
+  ].join(" ");
+}
+
+function handoffMessage() {
+  return [
+    `${filler()} great question.`,
+    "This is probably easier if someone on our team walks you through it properly.",
+    "Let me connect you real quick."
+  ].join(" ");
+}
+
+function followUpMessage() {
+  return [
+    "Got it — totally understand.",
+    "We can follow up another time that works better for you."
+  ].join(" ");
+}
+
+function rejectMessage() {
+  return [
+    "No worries at all.",
+    "If anything changes down the line, feel free to reach out.",
+    "Appreciate your time — have a great day."
+  ].join(" ");
+}
+
+function languageMessage() {
+  return [
+    "No problem at all.",
+    "We can follow up by text instead."
+  ].join(" ");
+}
+
+// --------------------------------------------------
+// 1) Incoming call entrypoint
+// --------------------------------------------------
+app.post("/voice", (req, res) => {
+  const callSid = req.body.CallSid;
+  const session = getSession(callSid);
+
+  session.stage = "permission";
+  saveTurn(session, "assistant", openingMessage());
+
+  res.type("text/xml").send(
+    twimlSayAndGather({
+      message: openingMessage(),
+      action: "/voice/respond"
+    })
+  );
 });
 
-app.get("/audio/:id", (req, res) => {
-  const { id } = req.params;
-  const audio = audioStore.get(id);
-
-  if (!audio) {
-    console.log("Audio not found:", id);
-    return res.status(404).send("Audio not found");
-  }
-
-  res.set("Content-Type", "audio/mpeg");
-  return res.send(audio);
-});
-
-app.post("/voice/incoming", async (req, res) => {
+// --------------------------------------------------
+// 2) Speech response handler
+// --------------------------------------------------
+app.post("/voice/respond", async (req, res) => {
   try {
-    console.log("===== /voice/incoming called =====");
+    const callSid = req.body.CallSid;
+    const speechText = req.body.SpeechResult || "";
+    const session = getSession(callSid);
 
-    if (
-      !ELEVENLABS_API_KEY ||
-      !VOICE_ID ||
-      !PUBLIC_BASE_URL ||
-      !OPENAI_API_KEY
-    ) {
-      return res.status(500).send("Missing environment variables");
+    saveTurn(session, "user", speechText);
+
+    const intent = detectIntent(speechText);
+    session.lastIntent = intent;
+
+    // Stage-driven handling
+    if (intent === "reject") {
+      session.result = "rejected";
+      saveTurn(session, "assistant", rejectMessage());
+      return res.type("text/xml").send(twimlSayAndHangup({ message: rejectMessage() }));
     }
 
-    const warmupText = getWarmupText();
-    const warmupAudioUrl = await createSingleAudioUrl(warmupText);
-    const twiml = buildGatherTwiml(warmupAudioUrl, "warmup");
+    if (intent === "busy") {
+      session.result = "follow_up";
+      saveTurn(session, "assistant", followUpMessage());
+      return res.type("text/xml").send(twimlSayAndHangup({ message: followUpMessage() }));
+    }
 
-    res.set("Content-Type", "text/xml");
-    return res.send(twiml);
+    if (intent === "language") {
+      session.result = "follow_up_text";
+      saveTurn(session, "assistant", languageMessage());
+      return res.type("text/xml").send(twimlSayAndHangup({ message: languageMessage() }));
+    }
+
+    if (intent === "deep_question") {
+      session.result = "transferred";
+      saveTurn(session, "assistant", handoffMessage());
+      return res.type("text/xml").send(twimlConnectHuman({ phoneNumber: process.env.HUMAN_FORWARD_NUMBER || "+15555555555" }));
+    }
+
+    if (intent === "interest") {
+      session.interestLevel = "yes_or_maybe";
+      session.result = "transferred";
+      saveTurn(session, "assistant", handoffMessage());
+      return res.type("text/xml").send(twimlConnectHuman({ phoneNumber: process.env.HUMAN_FORWARD_NUMBER || "+15555555555" }));
+    }
+
+    if (intent === "why_calling") {
+      session.stage = "explained_reason";
+      session.questionCount += 1;
+      const msg = `${whyCallingMessage()} ${firstQuestionMessage()}`;
+      saveTurn(session, "assistant", msg);
+      return res.type("text/xml").send(
+        twimlSayAndGather({ message: msg, action: "/voice/respond" })
+      );
+    }
+
+    // Stage-based default flow
+    if (session.stage === "permission") {
+      session.stage = "question_1";
+      session.questionCount += 1;
+      saveTurn(session, "assistant", firstQuestionMessage());
+      return res.type("text/xml").send(
+        twimlSayAndGather({ message: firstQuestionMessage(), action: "/voice/respond" })
+      );
+    }
+
+    if (session.stage === "question_1") {
+      session.stage = "question_2";
+      session.questionCount += 1;
+      saveTurn(session, "assistant", secondQuestionMessage());
+      return res.type("text/xml").send(
+        twimlSayAndGather({ message: secondQuestionMessage(), action: "/voice/respond" })
+      );
+    }
+
+    if (session.stage === "question_2") {
+      // After second question, any continued engagement gets handed off or gently ended.
+      const msg = await generateShortReply({ userText: speechText, session });
+      saveTurn(session, "assistant", msg);
+
+      return res.type("text/xml").send(
+        twimlSayAndGather({ message: msg, action: "/voice/respond" })
+      );
+    }
+
+    // Fallback
+    const fallback = await generateShortReply({ userText: speechText, session });
+    saveTurn(session, "assistant", fallback);
+
+    return res.type("text/xml").send(
+      twimlSayAndGather({ message: fallback, action: "/voice/respond" })
+    );
   } catch (error) {
-    console.error("incoming error:", error.message);
-
-    if (error.response) {
-      console.error("status:", error.response.status);
-      console.error("data:", error.response.data);
-    }
-
-    return res.status(500).send("Server error");
+    console.error("/voice/respond error:", error);
+    return res.type("text/xml").send(
+      twimlSayAndHangup({
+        message: "Sorry about that — we’ll follow up another time."
+      })
+    );
   }
 });
 
-app.post("/voice/process", async (req, res) => {
-  try {
-    const step = req.query.step || "warmup";
-    const userText = req.body.SpeechResult || "";
+// --------------------------------------------------
+// 3) Optional: inspect session logs
+// --------------------------------------------------
+app.get("/debug/session/:callSid", (req, res) => {
+  const session = sessions.get(req.params.callSid);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+  res.json(session);
+});
 
-    console.log("===== /voice/process called =====");
-    console.log("step:", step);
-    console.log("userText:", userText);
-
-    // 1) 예외 처리
-    const special = detectSpecialCase(userText);
-
-    if (special === "language") {
-      return respondAndHangup(getLanguageHandoffText(), res);
-    }
-
-    if (special === "busy") {
-      return respondAndHangup(getBusyHandoffText(), res);
-    }
-
-    if (special === "trust") {
-      return respondAndHangup(getTrustHandoffText(), res);
-    }
-
-    // 2) 얕은 질문 -> AI가 짧게 설명
-    if (isSimpleQuestion(userText)) {
-      return respondAndContinue(getSimpleQuestionAnswer(), "problem-check", res);
-    }
-
-    // 3) 깊은 질문 -> 사람에게 넘기고 종료
-    if (isDeepQuestion(userText)) {
-      return respondAndHangup(getDeepQuestionHandoffText(), res);
-    }
-
-    // 4) 첫 반응 이후 -> 짧은 질문 진입
-    if (step === "warmup") {
-      const replyText =
-        "Got it. Just wanted to ask real quick — are you usually the one handling calls there?";
-      return respondAndContinue(replyText, "intro", res);
-    }
-
-    // 5) 관심 있음 -> 사람 연결 후 종료
-    if (soundsInterested(userText)) {
-      return respondAndHangup(getInterestedHandoffText(), res);
-    }
-
-    // 6) 관심 없음 -> 자연스럽게 종료
-    if (detectIntent(userText) === "negative") {
-      return respondAndHangup(getNotInterestedClosingText(), res);
-    }
-
-    // 7) 나머지 -> GPT로 짧게 진행
-    const replyText = await generateReply(step, userText);
-    console.log("aiReply:", replyText);
-
-    if (step === "problem-check") {
-      return respondAndContinue(replyText, "close", res);
-    }
-
-    if (step === "close") {
-      return respondAndHangup(getSoftClosingText(), res);
-    }
-
-    return respondAndContinue(replyText, "problem-check", res);
-  } catch (error) {
-    console.error("process error:", error.message);
-
-    if (error.response) {
-      console.error("status:", error.response.status);
-      console.error("data:", error.response.data);
-    }
-
-    try {
-      const fallbackText = "Sorry — something went wrong. Thanks for your time.";
-      return respondAndHangup(fallbackText, res);
-    } catch (fallbackError) {
-      console.error("fallback error:", fallbackError.message);
-      return res.status(500).send("Server error");
-    }
-  }
+app.get("/", (_req, res) => {
+  res.send("Ringmate Sales AI Engine Running");
 });
 
 app.listen(PORT, () => {
-  console.log(`Ringmate Sales AI Server Running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Base URL: ${BASE_URL}`);
 });
