@@ -1,6 +1,5 @@
 import express from "express";
-import WebSocket from "ws";
-import fetch from "node-fetch";
+import WebSocket, { WebSocketServer } from "ws";
 
 const app = express();
 app.use(express.json());
@@ -10,8 +9,8 @@ const PORT = process.env.PORT || 3000;
 // OpenAI Realtime endpoint
 const REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-// Twilio Webhook (SIP 연결)
-app.post("/webhook", async (req, res) => {
+// Twilio Webhook
+app.post("/webhook", (req, res) => {
   const twiml = `
 <Response>
   <Connect>
@@ -22,19 +21,20 @@ app.post("/webhook", async (req, res) => {
   res.send(twiml);
 });
 
-// WebSocket server for Twilio Media Stream
+// 서버 실행
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
-const wss = new WebSocket.Server({ server, path: "/media-stream" });
+// ✅ 여기 수정됨
+const wss = new WebSocketServer({ server, path: "/media-stream" });
 
 wss.on("connection", (ws) => {
   console.log("📞 Twilio connected");
 
   let openaiWs;
 
-  // OpenAI Realtime 연결
+  // OpenAI 연결
   openaiWs = new WebSocket(REALTIME_URL, {
     headers: {
       "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -111,7 +111,7 @@ Identify interest and move to human follow-up.
       }
     }));
 
-    // 🔥 첫 발화 강제 (리듬 적용됨)
+    // 🔥 첫 발화
     openaiWs.send(JSON.stringify({
       type: "response.create",
       response: {
@@ -120,7 +120,7 @@ Identify interest and move to human follow-up.
     }));
   });
 
-  // OpenAI → Twilio (음성 전달)
+  // OpenAI → Twilio
   openaiWs.on("message", (message) => {
     const data = JSON.parse(message);
 
@@ -134,7 +134,7 @@ Identify interest and move to human follow-up.
     }
   });
 
-  // Twilio → OpenAI (사용자 음성 전달)
+  // Twilio → OpenAI
   ws.on("message", (message) => {
     const msg = JSON.parse(message);
 
