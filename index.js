@@ -8,7 +8,7 @@ app.use(express.urlencoded({ extended: false }));
 const PORT = process.env.PORT || 3000;
 const REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
 
-function twimlResponse(host) {
+function buildTwiml(host) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -18,21 +18,25 @@ function twimlResponse(host) {
 }
 
 app.get("/", (req, res) => {
+  console.log("GET / hit");
   res.status(200).send("Ringmate Sales AI Running");
 });
 
 app.post("/openai-realtime-webhook", (req, res) => {
+  console.log("POST /openai-realtime-webhook hit");
   res.sendStatus(200);
 });
 
 app.get("/webhook", (req, res) => {
+  console.log("GET /webhook hit");
   res.type("text/xml");
-  res.send(twimlResponse(req.headers.host));
+  res.send(buildTwiml(req.headers.host));
 });
 
 app.post("/webhook", (req, res) => {
+  console.log("POST /webhook hit");
   res.type("text/xml");
-  res.send(twimlResponse(req.headers.host));
+  res.send(buildTwiml(req.headers.host));
 });
 
 const server = app.listen(PORT, () => {
@@ -92,7 +96,7 @@ RHYTHM:
 
 CONVERSATION:
 - Ask only one question at a time.
-- Use short reactions naturally.
+- Use short natural reactions.
 - Never give long explanations.
 
 FLOW:
@@ -140,12 +144,12 @@ Identify interest and move to human follow-up.
     }
   });
 
-  openaiWs.on("close", () => {
-    console.log("🤖 OpenAI Realtime disconnected");
+  openaiWs.on("error", (err) => {
+    console.error("❌ OpenAI WS error:", err);
   });
 
-  openaiWs.on("error", (err) => {
-    console.error("OpenAI WS error:", err);
+  openaiWs.on("close", () => {
+    console.log("🤖 OpenAI Realtime disconnected");
   });
 
   ws.on("message", (message) => {
@@ -180,6 +184,6 @@ Identify interest and move to human follow-up.
   });
 
   ws.on("error", (err) => {
-    console.error("Twilio WS error:", err);
+    console.error("❌ Twilio WS error:", err);
   });
 });
