@@ -55,7 +55,15 @@ function detectIntent(text = "") {
   if (!t) return "unknown";
 
   if (
-    /not interested|no thanks|don't need|do not need|already have|we're good|we are good|stop calling|take me off|remove me|nope/.test(
+    /who's this|who is this|may i ask who's calling|who am i speaking with|who are you|who is calling/.test(
+      t
+    )
+  ) {
+    return "who_are_you";
+  }
+
+  if (
+    /not interested|no thanks|don't need|do not need|already have|we're good|we are good|stop calling|take me off|remove me|nope|not really/.test(
       t
     )
   ) {
@@ -63,7 +71,7 @@ function detectIntent(text = "") {
   }
 
   if (
-    /busy|in a meeting|call me later|can't talk|cannot talk|not a good time|driving|with a client|with customer/.test(
+    /busy|in a meeting|call me later|can't talk|cannot talk|not a good time|driving|with a client|with customer|i'm busy|we're busy/.test(
       t
     )
   ) {
@@ -71,7 +79,7 @@ function detectIntent(text = "") {
   }
 
   if (
-    /yes|yeah|yep|sure|okay|ok|possibly|maybe|i think so|interested|sounds good|that could help/.test(
+    /yes|yeah|yep|sure|okay|ok|possibly|maybe|i think so|interested|sounds good|that could help|worth a look|probably/.test(
       t
     )
   ) {
@@ -79,7 +87,7 @@ function detectIntent(text = "") {
   }
 
   if (
-    /what is this|who is this|what do you do|can you explain|how does it work|tell me more|what does ringmate do/.test(
+    /what is this|what do you do|can you explain|how does it work|tell me more|what does ringmate do|what is ringmate/.test(
       t
     )
   ) {
@@ -87,7 +95,7 @@ function detectIntent(text = "") {
   }
 
   if (
-    /manual|myself|me|we do it ourselves|front desk|receptionist|staff handles it/.test(
+    /manual|myself|me|we do it ourselves|front desk|receptionist|staff handles it|we handle it|i handle it/.test(
       t
     )
   ) {
@@ -95,7 +103,7 @@ function detectIntent(text = "") {
   }
 
   if (
-    /system|software|platform|service|answering service|ai|automation|ivr|we already use/.test(
+    /system|software|platform|service|answering service|ai|automation|ivr|we already use|we use a system/.test(
       t
     )
   ) {
@@ -103,14 +111,30 @@ function detectIntent(text = "") {
   }
 
   if (
-    /miss calls|after hours|voicemail|too many calls|hard to keep up|busy times|overflow|weekends/.test(
+    /miss calls|after hours|voicemail|too many calls|hard to keep up|busy times|overflow|weekends|sometimes we miss|all the time/.test(
       t
     )
   ) {
     return "pain";
   }
 
-  if (/\b\d+\b/.test(t)) {
+  if (
+    /this number|best number|yes this is fine|you can call me here|this is the best number|this one is fine|yes call this number/.test(
+      t
+    )
+  ) {
+    return "confirm_number";
+  }
+
+  if (
+    /text is fine|you can text me|yes text is okay|sure text me|text me|text is okay|that's fine/.test(
+      t
+    )
+  ) {
+    return "text_ok";
+  }
+
+  if (/\b\d{1,3}\b/.test(t)) {
     return "number";
   }
 
@@ -129,15 +153,18 @@ function detectCallVolume(text = "") {
 
 function createSessionState() {
   return {
-    stage: "intro",
+    stage: "opening",
     leadScore: 0,
     customer: {
-      handlingMode: null, // manual | existing_system | unknown
+      handlingMode: null,
       hasPain: null,
       callVolume: null,
-      interestLevel: null, // low | medium | high
+      interestLevel: null,
+      askedWho: false,
       askedWhatItIs: false,
       busyNow: false,
+      callbackNumberConfirmed: false,
+      textOk: false,
     },
     memory: [],
     lastAssistantText: "",
@@ -155,6 +182,11 @@ function remember(state, key, value) {
 
 function updateStateFromUser(state, userText, intent) {
   state.lastUserText = userText;
+
+  if (intent === "who_are_you") {
+    state.customer.askedWho = true;
+    remember(state, "askedWho", true);
+  }
 
   if (intent === "manual") {
     state.customer.handlingMode = "manual";
@@ -195,6 +227,16 @@ function updateStateFromUser(state, userText, intent) {
     state.leadScore -= 15;
   }
 
+  if (intent === "confirm_number") {
+    state.customer.callbackNumberConfirmed = true;
+    remember(state, "callbackNumberConfirmed", true);
+  }
+
+  if (intent === "text_ok") {
+    state.customer.textOk = true;
+    remember(state, "textOk", true);
+  }
+
   const volume = detectCallVolume(userText);
   if (volume !== null) {
     state.customer.callVolume = volume;
@@ -228,12 +270,24 @@ function getShortContextSummary(state) {
     parts.push(`interestLevel=${state.customer.interestLevel}`);
   }
 
+  if (state.customer.askedWho) {
+    parts.push("askedWho=true");
+  }
+
   if (state.customer.askedWhatItIs) {
-    parts.push(`askedWhatItIs=true`);
+    parts.push("askedWhatItIs=true");
   }
 
   if (state.customer.busyNow) {
-    parts.push(`busyNow=true`);
+    parts.push("busyNow=true");
+  }
+
+  if (state.customer.callbackNumberConfirmed) {
+    parts.push("callbackNumberConfirmed=true");
+  }
+
+  if (state.customer.textOk) {
+    parts.push("textOk=true");
   }
 
   return parts.join(", ");
@@ -244,8 +298,7 @@ function decideNextAction(state, userText, intent) {
     return {
       type: "end",
       goal: "close",
-      message:
-        "Thanks again — appreciate your time. Have a good one.",
+      message: "Thanks again — appreciate your time. Have a good one.",
     };
   }
 
@@ -255,8 +308,7 @@ function decideNextAction(state, userText, intent) {
     return {
       type: "end",
       goal: "exit",
-      message:
-        "Totally understand — no problem at all. Thanks for your time.",
+      message: "Totally understand — no problem at all. Thanks for your time.",
     };
   }
 
@@ -266,27 +318,75 @@ function decideNextAction(state, userText, intent) {
     return {
       type: "end",
       goal: "callback_later",
-      message:
-        "No worries — sounds like a busy moment. I’ll keep it short. Thanks anyway.",
+      message: "No worries — sounds like a busy moment. I’ll let you go. Thanks anyway.",
     };
   }
 
-  if (state.stage === "intro") {
+  if (state.stage === "opening") {
+    if (intent === "who_are_you") {
+      state.stage = "identity";
+      return {
+        type: "answer",
+        goal: "identity_intro",
+        message:
+          "Hey — this is Alex with Ringmate. We help businesses handle missed calls and booking-related calls a bit more smoothly.",
+      };
+    }
+
+    if (intent === "curious") {
+      state.stage = "identity";
+      return {
+        type: "answer",
+        goal: "identity_from_curious",
+        message:
+          "Yeah — absolutely. This is Alex with Ringmate. We help businesses handle missed calls and booking-related calls a bit more smoothly.",
+      };
+    }
+
+    state.stage = "bridge";
+    return {
+      type: "ask",
+      goal: "soft_bridge",
+      message:
+        "Hey — this is Alex with Ringmate. Just wanted to ask you something quick about how you’re handling incoming calls right now.",
+    };
+  }
+
+  if (state.stage === "identity") {
     state.stage = "qualification";
     return {
       type: "ask",
-      goal: "qualification",
+      goal: "bridge_to_qualification",
       message:
-        "Quick question — are you handling incoming calls yourself right now, or do you already have some kind of system in place?",
+        "Just wanted to ask you something quick — are you handling most of your incoming calls manually right now, or do you already have some kind of system in place?",
+    };
+  }
+
+  if (state.stage === "bridge") {
+    state.stage = "qualification";
+    return {
+      type: "ask",
+      goal: "qualification_after_bridge",
+      message:
+        "Are you handling most of your incoming calls manually right now, or do you already have some kind of system in place?",
     };
   }
 
   if (state.stage === "qualification") {
+    if (intent === "who_are_you") {
+      return {
+        type: "answer",
+        goal: "identity_repeat",
+        message:
+          "Yeah — of course. This is Alex with Ringmate. We help businesses deal with missed calls and booking-related calls more smoothly.",
+      };
+    }
+
     if (intent === "manual") {
       state.stage = "pain";
       return {
         type: "ask",
-        goal: "pain_check",
+        goal: "pain_check_manual",
         message:
           "Got it. Do you ever miss calls or booking requests when things get busy?",
       };
@@ -298,7 +398,7 @@ function decideNextAction(state, userText, intent) {
         type: "ask",
         goal: "pain_check_existing",
         message:
-          "Okay — makes sense. Even with that, do you still run into missed calls or after-hours gaps sometimes?",
+          "Okay — makes sense. Even with that in place, do you still run into missed calls or after-hours gaps sometimes?",
       };
     }
 
@@ -307,7 +407,7 @@ function decideNextAction(state, userText, intent) {
         type: "answer_then_ask",
         goal: "qualification_recover",
         message:
-          "We help businesses catch missed calls and book more customers without adding front-desk pressure. Quick question — are you handling calls yourself right now?",
+          "We help businesses catch missed calls and handle booking-related calls more smoothly without adding more front-desk pressure. Quick question — are you mostly handling that manually right now?",
       };
     }
 
@@ -325,7 +425,7 @@ function decideNextAction(state, userText, intent) {
       state.stage = "volume";
       return {
         type: "ask",
-        goal: "volume",
+        goal: "volume_after_pain",
         message:
           "Yeah — that’s exactly the kind of situation we help with. About how many calls or booking requests do you usually get in a day or week?",
       };
@@ -335,9 +435,9 @@ function decideNextAction(state, userText, intent) {
       state.stage = "interest_check";
       return {
         type: "ask",
-        goal: "interest_check_after_number",
+        goal: "interest_after_number_from_pain",
         message:
-          "Got it. If there were a way to catch more of those without adding more manual work, would that be worth a look?",
+          "Got it. If there were a way to catch more of those without adding more manual work, would that be worth a quick look?",
       };
     }
 
@@ -346,7 +446,7 @@ function decideNextAction(state, userText, intent) {
         type: "answer_then_ask",
         goal: "pain_explain",
         message:
-          "It’s basically a phone AI that helps answer missed calls, qualify leads, and help with bookings. Quick question though — do missed calls ever happen when things get busy?",
+          "It’s basically a phone AI that helps answer missed calls, qualify leads, and help with booking-related calls. Quick question though — do missed calls ever happen when things get busy?",
       };
     }
 
@@ -366,7 +466,7 @@ function decideNextAction(state, userText, intent) {
         type: "ask",
         goal: "interest_check",
         message:
-          "Got it. If something could help you capture more of those calls automatically, would you be open to taking a quick look at it?",
+          "Got it. If something could help you capture more of those calls without adding more work, would that be worth a quick look?",
       };
     }
 
@@ -391,14 +491,12 @@ function decideNextAction(state, userText, intent) {
     if (intent === "positive" || intent === "curious") {
       state.customer.interestLevel = "high";
       state.leadScore += 12;
-      state.stage = "handoff";
-      state.finished = true;
-
+      state.stage = "handoff_number";
       return {
-        type: "end",
-        goal: "handoff",
+        type: "ask",
+        goal: "confirm_callback_number",
         message:
-          "Nice — sounds like it could be worth a quick follow-up. We can have someone reach out and show you how it works.",
+          "Got it — makes sense. The next step would just be a quick follow-up from our side. Would this be the best number to reach you on?",
       };
     }
 
@@ -408,28 +506,69 @@ function decideNextAction(state, userText, intent) {
       state.finished = true;
       return {
         type: "end",
-        goal: "exit_after_interest_check",
-        message:
-          "Totally fair — no pressure. Thanks for taking the call.",
+        goal: "exit_after_interest",
+        message: "Totally fair — no pressure. Thanks for taking the call.",
       };
     }
 
     state.customer.interestLevel = "medium";
-    state.stage = "handoff";
+    state.stage = "exit";
     state.finished = true;
     return {
       type: "end",
-      goal: "soft_handoff",
+      goal: "soft_exit",
       message:
-        "No problem — I’ll leave it there for now. If it becomes a priority later, it could definitely help with missed-call coverage.",
+        "No problem — I’ll leave it there for now. Appreciate your time.",
+    };
+  }
+
+  if (state.stage === "handoff_number") {
+    if (intent === "confirm_number" || intent === "positive" || intent === "unknown") {
+      state.customer.callbackNumberConfirmed = true;
+      state.stage = "handoff_text";
+      return {
+        type: "ask",
+        goal: "confirm_text_ok",
+        message:
+          "Perfect. And if you happen to miss the call, is text okay too?",
+      };
+    }
+
+    return {
+      type: "ask",
+      goal: "confirm_callback_number_repeat",
+      message:
+        "Just to make sure — would this be the best number for a quick follow-up call?",
+    };
+  }
+
+  if (state.stage === "handoff_text") {
+    if (intent === "text_ok" || intent === "positive" || intent === "unknown") {
+      state.customer.textOk = true;
+      state.stage = "close";
+      state.finished = true;
+      return {
+        type: "end",
+        goal: "clean_handoff_close",
+        message:
+          "Perfect — appreciate it. Someone from our side will reach out shortly. Thanks again.",
+      };
+    }
+
+    state.stage = "close";
+    state.finished = true;
+    return {
+      type: "end",
+      goal: "close_without_text",
+      message:
+        "Got it — no problem. Someone from our side will give you a quick call soon. Appreciate it.",
     };
   }
 
   return {
     type: "end",
     goal: "fallback_close",
-    message:
-      "Alright — thanks for your time. Have a great rest of your day.",
+    message: "Alright — thanks for your time. Have a great rest of your day.",
   };
 }
 
@@ -440,7 +579,7 @@ async function naturalizeMessage(baseMessage, state, userText, abortSignal) {
     {
       model: "gpt-4o-mini",
       temperature: 0.35,
-      max_tokens: 80,
+      max_tokens: 90,
       messages: [
         {
           role: "system",
@@ -456,23 +595,24 @@ Style:
 - sound like a real human
 - warm, calm, conversational
 - short
-- usually 1 sentence, sometimes 2 very short sentences
+- usually 1 sentence, sometimes 2 short sentences
 - never formal
 - never robotic
-- never salesy
+- never aggressive
+- never overly salesy
 - never over-explain
 - one question at a time
 - use light spoken fillers sometimes: "yeah", "okay", "right", "got it"
 - spoken pauses with dashes are allowed
 - keep it easy to say aloud
 - do not use bullet points
-- do not mention being AI unless explicitly included in the base line
+- do not mention being AI unless explicitly included
 - output only the final spoken line
 
-Good tone examples:
-- "Yeah — got it. Quick question — are you handling calls yourself right now?"
-- "Okay — makes sense. Do you ever miss calls when it gets busy?"
-- "Right — got it. About how many calls do you usually get in a day?"
+Important:
+- if the user asked "who's this", answer identity first
+- early part of the call should feel soft, not pushy
+- if interest is confirmed, closing should smoothly hand off to a human follow-up
           `.trim(),
         },
         {
@@ -493,9 +633,7 @@ Rewrite this naturally for a live phone call:
     { signal: abortSignal }
   );
 
-  const text =
-    response.choices?.[0]?.message?.content?.trim() || baseMessage;
-
+  const text = response.choices?.[0]?.message?.content?.trim() || baseMessage;
   return cleanText(text);
 }
 
@@ -520,7 +658,6 @@ wss.on("connection", (ws) => {
 
   async function sendThinkingFiller(responseId) {
     const fillers = ["Yeah —", "Okay —", "Got it —", "Right —", "Mm-hmm —"];
-
     const filler = pickRandom(fillers);
 
     if (responseId !== activeResponseId) return false;
