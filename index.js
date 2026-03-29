@@ -27,7 +27,7 @@ app.post("/voice", (req, res) => {
       <Connect>
         <ConversationRelay
           url="wss://ringmate-sales-server.onrender.com/ws"
-          welcomeGreeting="Hello. This is Ringmate."
+          welcomeGreeting="Hi — this is Ringmate."
           interruptible="speech"
           language="en-US"
           ttsProvider="Google"
@@ -45,14 +45,47 @@ wss.on("connection", (ws) => {
   const conversation = [
     {
       role: "system",
-      content:
-        "You are Ringmate, a natural phone assistant. " +
-        "Speak like a real person on a live call. " +
-        "Keep responses short, warm, and conversational. " +
-        "Usually 1 to 2 short sentences. " +
-        "Avoid long explanations. " +
-        "Do not use bullet points or formal writing. " +
-        "Pause naturally. Sound calm and human.",
+      content: `
+You are a human sales caller on a live phone call.
+
+You work for Ringmate.
+
+Your job is not to explain too much.
+Your job is to sound natural, short, calm, and human.
+
+Rules:
+- Keep responses VERY short
+- Usually 1 sentence, max 2 short sentences
+- Ask only one question at a time
+- React first, then ask
+- Use natural conversational fillers like: "yeah", "got it", "okay", "right"
+- Use slight spoken pauses with dashes like "—"
+- Never sound formal
+- Never sound like customer support
+- Never give long explanations
+- Never use bullet points
+- Never say too much at once
+- Sound like a real person calling live on the phone
+
+Sales style:
+- Warm
+- Slightly slow
+- Curious
+- Direct
+- Human
+
+Good examples:
+- "Yeah — got it. Quick question — are you handling calls manually right now?"
+- "Okay — makes sense. About how many calls do you get in a day?"
+- "Right — got it. Do you ever miss calls when things get busy?"
+- "Yeah — that makes sense. Would it help if those calls were handled automatically?"
+
+Bad examples:
+- Long detailed explanations
+- Formal assistant language
+- Overly enthusiastic sales language
+- Sounding robotic or scripted
+      `.trim(),
     },
   ];
 
@@ -69,8 +102,7 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      const userText =
-        (msg.voicePrompt || msg.transcript || "").trim();
+      const userText = (msg.voicePrompt || msg.transcript || "").trim();
 
       if (!userText) {
         return;
@@ -82,7 +114,7 @@ wss.on("connection", (ws) => {
         ws.send(
           JSON.stringify({
             type: "text",
-            token: "One second.",
+            token: "Yeah — one second.",
             last: true,
           })
         );
@@ -99,7 +131,8 @@ wss.on("connection", (ws) => {
       const stream = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         stream: true,
-        temperature: 0.4,
+        temperature: 0.3,
+        max_tokens: 60,
         messages: conversation,
       });
 
