@@ -1,237 +1,246 @@
 import express from "express";
-import WebSocket, { WebSocketServer } from "ws";
+import WebSocket from "ws";
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
 
-const PORT = process.env.PORT || 3000;
-const REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime";
+const activeCalls = new Map();
 
-function buildTwiml(host) {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://${host}/media-stream" />
-  </Connect>
-</Response>`;
-}
+const PORT = process.env.PORT || 10000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 app.get("/", (req, res) => {
-  console.log("GET / hit");
-  res.status(200).send("Ringmate Sales AI Running");
+  res.send("Ringmate SIP realtime server running");
 });
 
-app.post("/openai-realtime-webhook", (req, res) => {
-  console.log("POST /openai-realtime-webhook hit");
-  res.sendStatus(200);
-});
+app.post("/openai-realtime-webhook", async (req, res) => {
+  try {
+    const event = req.body;
+    console.log("Incoming webhook event:", JSON.stringify(event, null, 2));
 
-app.get("/webhook", (req, res) => {
-  console.log("GET /webhook hit");
-  res.type("text/xml");
-  res.send(buildTwiml(req.headers.host));
-});
+    // OpenAI webhook에는 무조건 바로 응답
+    res.status(200).send("ok");
 
-app.post("/webhook", (req, res) => {
-  console.log("POST /webhook hit");
-  res.type("text/xml");
-  res.send(buildTwiml(req.headers.host));
-});
+    if (event?.type !== "realtime.call.incoming") return;
 
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
-
-const wss = new WebSocketServer({ server, path: "/media-stream" });
-
-wss.on("connection", (twilioWs) => {
-  console.log("📞 Twilio connected to /media-stream");
-
-  let streamSid = null;
-  let openaiReady = false;
-
-  const openaiWs = new WebSocket(REALTIME_URL, {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
+    const callId = event?.data?.call_id;
+    if (!callId) {
+      console.log("No call_id found");
+      return;
     }
-  });
 
-  const sendInitialGreeting = () => {
-    if (openaiWs.readyState !== WebSocket.OPEN) return;
+    if (activeCalls.has(callId)) {
+      console.log("Call already being handled:", callId);
+      return;
+    }
 
-    openaiWs.send(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio"],
-        instructions:
-          "Hi... this is Alex... from Ringmate. I'll be brief... did I catch you in the middle of something?"
-      }
-    }));
-  };
+    activeCalls.set(callId, {
+      startedAt: Date.now(),
+      accepted: false,
+      ws: null,
+      openerSent: false
+    });
 
-  openaiWs.on("open", () => {
-    console.log("🤖 Connected to OpenAI Realtime");
-
-    openaiWs.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        type: "realtime",
-        model: "gpt-realtime",
-        output_modalities: ["audio"],
-        instructions: `
-You are a natural outbound sales caller for Ringmate.
-
-Your tone is calm, deep, mature, and composed.
-You speak like a real adult, not a pushy salesperson.
-
-VOICE:
-- Speak in a deeper, heavier tone.
-- Use slow, deliberate speech.
-- Never sound bright, fast, or overly energetic.
-
-PACING:
-- Speak at a moderately slow pace.
-- Keep sentences short.
-- One idea per sentence.
-- Pause after every sentence.
-- Add slight pauses between phrases.
-- Do not speak continuously.
-
-RHYTHM:
-- Break speech into small chunks.
-- Let phrases land.
-- Slight hesitation is natural.
-
-CONVERSATION:
-- Ask only one question at a time.
-- Use short natural reactions.
-- Never give long explanations.
-- Never stack questions.
-
-FLOW:
-1. Greet naturally
-2. Confirm availability
-3. Ask one simple question
-4. Wait
-5. React briefly
-6. Ask next
-7. Briefly explain Ringmate
-8. Ask interest
-9. If interested, move to human follow-up
-
-IMPORTANT:
-- Never rush
-- Never sound scripted
-- Always leave pauses
-- Sound human, not perfect
-
-GOAL:
-Identify interest and move to human follow-up.
-        `,
-        audio: {
-          input: {
-            format: {
-              type: "audio/pcmu"
-            },
-            turn_detection: {
-              type: "server_vad"
+    // 1) 콜 수락
+    const acceptRes = await fetch(
+      `https://api.openai.com/v1/realtime/calls/${callId}/accept`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          type: "realtime",
+          model: "gpt-realtime",
+          audio: {
+            output: {
+              voice: "cedar"
             }
           },
-          output: {
-            format: {
-              type: "audio/pcmu"
-            },
-            voice: "cedar"
+          instructions: `
+You are Alex from Ringmate.
+
+ROLE
+You are making a real outbound-style business call.
+Your job is to sound natural, calm, mature, and easy to talk to.
+
+STYLE
+- Speak like a real adult, not a scripted telemarketer.
+- Keep sentences short.
+- Use one thought at a time.
+- Ask only one question at a time.
+- Do not give long explanations.
+- Do not stack questions.
+- Keep the flow conversational.
+
+VOICE
+- Calm
+- Grounded
+- Mature
+- Slightly warm
+- Moderate pace
+- Never rushed
+- Never overly cheerful
+- Never robotic
+
+BEHAVIOR
+- Start speaking first when the call connects.
+- After the person answers, briefly acknowledge them.
+- Then continue with one short next question.
+- If they sound busy, be respectful and brief.
+- If they are not interested, exit politely.
+- If they show interest, offer a human follow-up.
+
+GOAL
+Find out whether they still handle calls manually and whether missed calls are a problem.
+If there is interest, move the conversation toward a human follow-up.
+          `
+        })
+      }
+    );
+
+    const acceptText = await acceptRes.text();
+    console.log("ACCEPT STATUS:", acceptRes.status);
+    console.log("ACCEPT BODY:", acceptText);
+
+    if (!acceptRes.ok) {
+      activeCalls.delete(callId);
+      return;
+    }
+
+    activeCalls.set(callId, {
+      ...activeCalls.get(callId),
+      accepted: true
+    });
+
+    // 2) accepted call websocket 연결
+    const ws = new WebSocket(
+      `wss://api.openai.com/v1/realtime?call_id=${callId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "OpenAI-Beta": "realtime=v1"
+        }
+      }
+    );
+
+    activeCalls.set(callId, {
+      ...activeCalls.get(callId),
+      ws
+    });
+
+    let sessionReady = false;
+
+    ws.on("open", () => {
+      console.log("Realtime websocket connected for call:", callId);
+
+      // 3) 세션 성격만 짧게 업데이트
+      ws.send(
+        JSON.stringify({
+          type: "session.update",
+          session: {
+            type: "realtime",
+            model: "gpt-realtime",
+            instructions: `
+You are Alex from Ringmate.
+
+Talk like a real person.
+Stay calm, mature, brief, and natural.
+Never sound scripted.
+Use short sentences.
+Ask one question at a time.
+Pause and wait after each question.
+Acknowledge briefly before moving on.
+Do not over-explain.
+Do not become pushy.
+If they are interested, suggest a human follow-up.
+            `
           }
-        }
-      }
-    }));
+        })
+      );
+    });
 
-    openaiReady = true;
-    sendInitialGreeting();
-  });
+    const sendOpening = () => {
+      const state = activeCalls.get(callId);
+      if (!state || state.openerSent || !sessionReady) return;
 
-  openaiWs.on("message", (message) => {
-    try {
-      const data = JSON.parse(message.toString());
+      state.openerSent = true;
+      activeCalls.set(callId, state);
 
-      // 디버깅용
-      if (
-        data.type === "error" ||
-        data.type === "session.created" ||
-        data.type === "session.updated" ||
-        data.type === "response.created" ||
-        data.type === "response.done"
-      ) {
-        console.log("OpenAI event:", data.type, JSON.stringify(data));
-      }
+      ws.send(
+        JSON.stringify({
+          type: "response.create",
+          response: {
+            instructions: `
+Start speaking now.
 
-      // 중요: 현재는 response.output_audio.delta 사용
-      if (data.type === "response.output_audio.delta" && data.delta && streamSid) {
-        twilioWs.send(JSON.stringify({
-          event: "media",
-          streamSid,
-          media: {
-            payload: data.delta
+Use this opening style:
+calm, confident, natural, brief.
+
+Say:
+"Hi, this is Alex with Ringmate... quick question."
+
+Then ask:
+"Are you the one handling calls over there?"
+
+Then stop and wait for their answer.
+            `
           }
-        }));
-      }
-    } catch (err) {
-      console.error("❌ Failed to parse OpenAI message:", err);
-    }
-  });
+        })
+      );
+    };
 
-  openaiWs.on("error", (err) => {
-    console.error("❌ OpenAI WS error:", err);
-  });
+    ws.on("message", (data) => {
+      const text = data.toString();
+      console.log("Realtime event:", text);
 
-  openaiWs.on("close", (code, reason) => {
-    console.log("🤖 OpenAI Realtime disconnected", code, reason?.toString());
-  });
+      try {
+        const msg = JSON.parse(text);
 
-  twilioWs.on("message", (message) => {
-    try {
-      const msg = JSON.parse(message.toString());
-
-      if (msg.event === "connected") {
-        console.log("🔗 Twilio stream connected");
-      }
-
-      if (msg.event === "start") {
-        streamSid = msg.start?.streamSid || null;
-        console.log("▶️ Call started:", streamSid);
-      }
-
-      if (msg.event === "media") {
-        if (openaiReady && openaiWs.readyState === WebSocket.OPEN && msg.media?.payload) {
-          openaiWs.send(JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: msg.media.payload
-          }));
+        if (
+          msg.type === "session.updated" ||
+          msg.type === "session.created"
+        ) {
+          sessionReady = true;
+          sendOpening();
         }
-      }
 
-      if (msg.event === "stop") {
-        console.log("⏹ Call ended");
-        if (openaiWs.readyState === WebSocket.OPEN) {
-          openaiWs.close();
+        if (msg.type === "error") {
+          console.error("Realtime error event:", JSON.stringify(msg, null, 2));
         }
+      } catch (err) {
+        console.error("Failed to parse realtime message:", err);
       }
-    } catch (err) {
-      console.error("❌ Failed to parse Twilio message:", err);
-    }
-  });
+    });
 
-  twilioWs.on("close", () => {
-    console.log("❌ Twilio disconnected");
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.close();
-    }
-  });
+    ws.on("error", (err) => {
+      console.error("Realtime websocket error:", err);
+    });
 
-  twilioWs.on("error", (err) => {
-    console.error("❌ Twilio WS error:", err);
-  });
+    ws.on("close", () => {
+      console.log("Realtime websocket closed for call:", callId);
+      activeCalls.delete(callId);
+    });
+
+    // safety cleanup
+    setTimeout(() => {
+      if (activeCalls.has(callId)) {
+        console.log("Cleaning up stale call:", callId);
+        try {
+          activeCalls.get(callId)?.ws?.close();
+        } catch {}
+        activeCalls.delete(callId);
+      }
+    }, 10 * 60 * 1000);
+  } catch (error) {
+    console.error("Webhook error:", error);
+    if (!res.headersSent) {
+      res.status(500).send("error");
+    }
+  }
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server listening on port ${PORT}`);
 });
