@@ -13,9 +13,12 @@ app.post("/openai-realtime-webhook", async (req, res) => {
     const event = req.body;
     console.log("Incoming webhook event:", JSON.stringify(event, null, 2));
 
+    // OpenAI webhook에는 먼저 바로 응답
     res.status(200).send("ok");
 
-    if (event?.type !== "realtime.call.incoming") return;
+    if (event?.type !== "realtime.call.incoming") {
+      return;
+    }
 
     const callId = event?.data?.call_id;
     if (!callId) {
@@ -23,12 +26,13 @@ app.post("/openai-realtime-webhook", async (req, res) => {
       return;
     }
 
+    // 1) 전화 accept
     const acceptRes = await fetch(
       `https://api.openai.com/v1/realtime/calls/${callId}/accept`,
       {
         method: "POST",
         headers: {
-          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
@@ -36,10 +40,31 @@ app.post("/openai-realtime-webhook", async (req, res) => {
           model: "gpt-realtime",
           instructions: `
 You are Alex from Ringmate.
-Speak naturally, warmly, and confidently.
-Keep responses short and conversational.
-Sound like a real human, not a robot.
-`
+
+ROLE:
+- You are a natural outbound caller for Ringmate.
+- You sound human, warm, calm, and confident.
+
+IMPORTANT:
+- Start speaking immediately when the call connects.
+- Do NOT wait for the user to speak first.
+- Keep sentences short.
+- Ask one short question at a time.
+- Do not sound robotic or scripted.
+- Do not give long explanations.
+- In the first few seconds, do not sound overly salesy.
+
+STYLE:
+- Natural
+- Conversational
+- Slightly warm
+- Professional but casual
+
+GOAL:
+- Start the conversation smoothly.
+- Find out whether they are handling calls manually.
+- Keep the flow natural.
+          `
         })
       }
     );
@@ -48,8 +73,12 @@ Sound like a real human, not a robot.
     console.log("ACCEPT STATUS:", acceptRes.status);
     console.log("ACCEPT BODY:", acceptText);
 
-    if (!acceptRes.ok) return;
+    if (!acceptRes.ok) {
+      console.log("Accept failed, stopping here.");
+      return;
+    }
 
+    // 2) accept 후 websocket 연결
     const ws = new WebSocket(
       `wss://api.openai.com/v1/realtime?call_id=${callId}`,
       {
@@ -63,18 +92,26 @@ Sound like a real human, not a robot.
     ws.on("open", () => {
       console.log("Realtime websocket connected for call:", callId);
 
-      ws.send(JSON.stringify({
-        type: "response.create",
-        response: {
-          instructions: `
+      // 3) 연결되자마자 첫 멘트 강제 생성
+      ws.send(
+        JSON.stringify({
+          type: "response.create",
+          response: {
+            instructions: `
 Start speaking immediately.
 Do not wait for the user to speak first.
 
-Say exactly:
+Say:
 "Hey — this is Alex from Ringmate... quick question. Are you the one handling calls over there?"
-`
-        }
-      }));
+
+After that:
+- Pause briefly
+- Let the user answer
+- Continue naturally
+            `
+          }
+        })
+      );
     });
 
     ws.on("message", (data) => {
@@ -88,7 +125,6 @@ Say exactly:
     ws.on("close", () => {
       console.log("Realtime websocket closed for call:", callId);
     });
-
   } catch (error) {
     console.error("Webhook error:", error);
     if (!res.headersSent) {
