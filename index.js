@@ -1,8 +1,15 @@
 import express from "express";
 import http from "http";
 import { WebSocketServer } from "ws";
+import OpenAI from "openai";
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -11,7 +18,6 @@ app.get("/", (req, res) => {
   res.send("Ringmate server running");
 });
 
-// Twilio가 전화 들어오면 여기로 POST
 app.post("/voice", (req, res) => {
   console.log("📞 Incoming call");
 
@@ -21,64 +27,150 @@ app.post("/voice", (req, res) => {
       <Connect>
         <ConversationRelay
           url="wss://ringmate-sales-server.onrender.com/ws"
-          welcomeGreeting="Hello. This is Ringmate realtime test."
+          welcomeGreeting="Hello. This is Ringmate."
           interruptible="speech"
           language="en-US"
           ttsProvider="Google"
-          voice="en-US-Standard-C">
-        </ConversationRelay>
+          voice="en-US-Standard-C" />
       </Connect>
     </Response>
   `);
 });
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
-
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   console.log("🔌 Twilio ConversationRelay connected");
 
-  ws.on("message", (raw) => {
+  let isGenerating = false;
+
+  const conversation = [
+    {
+      role: "system",
+      content:
+        "You are Ringmate, a natural phone assistant. " +
+        "Speak like a real person on a live call. " +
+        "Keep responses short, warm, and conversational. " +
+        "Usually 1 to 2 short sentences. " +
+        "Avoid long explanations. " +
+        "Do not use bullet points or formal writing. " +
+        "Pause naturally. Sound calm and human.",
+    },
+  ];
+
+  ws.on("message", async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
       console.log("📩 From Twilio:", msg);
 
-      // 첫 연결/시작 이벤트가 오면 테스트 응답 1회 보내기
-      // 실제 이벤트 이름은 Twilio 로그에서 확인하면서 맞춰가면 된다.
-      if (
-        msg.type === "setup" ||
-        msg.type === "connected" ||
-        msg.type === "start"
-      ) {
-        ws.send(
-          JSON.stringify({
-            type: "text",
-            token: "Realtime connection is working."
-          })
-        );
+      if (msg.type === "setup") {
+        return;
       }
 
-      // 사용자가 말한 텍스트가 오면 에코 테스트
-      if (msg.type === "prompt" && msg.voicePrompt) {
-        ws.send(
-          JSON.stringify({
-            type: "text",
-            token: `You said: ${msg.voicePrompt}`
-          })
-        );
+      if (msg.type !== "prompt") {
+        return;
       }
 
-      // 일부 계정/설정에서는 transcript 필드로 올 수 있어서 같이 처리
-      if (msg.type === "prompt" && msg.transcript) {
+      const userText =
+        (msg.voicePrompt || msg.transcript || "").trim();
+
+      if (!userText) {
+        return;
+      }
+
+      console.log("👤 User said:", userText);
+
+      if (isGenerating) {
         ws.send(
           JSON.stringify({
             type: "text",
-            token: `You said: ${msg.transcript}`
+            token: "One second.",
+            last: true,
           })
         );
+        return;
       }
-    } catch (err) {
-      console.error("❌ WS parse error:", err.message);
+
+      isGenerating = true;
+
+      conversation.push({
+        role: "user",
+        content: userText,
+      });
+
+      const stream = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        stream: true,
+        temperature: 0.4,
+        messages: conversation,
+      });
+
+      let fullAssistantText = "";
+      let pendingToken = null;
+
+      for await (const chunk of stream) {
+        const delta = chunk.choices?.[0]?.delta?.content || "";
+        if (!delta) continue;
+
+        fullAssistantText += delta;
+
+        if (pendingToken !== null) {
+          ws.send(
+            JSON.stringify({
+              type: "text",
+              token: pendingToken,
+              last: false,
+            })
+          );
+        }
+
+        pendingToken = delta;
+      }
+
+      if (pendingToken !== null) {
+        ws.send(
+          JSON.stringify({
+            type: "text",
+            token: pendingToken,
+            last: true,
+          })
+        );
+      } else {
+        ws.send(
+          JSON.stringify({
+            type: "text",
+            token: "Sorry — could you say that again?",
+            last: true,
+          })
+        );
+        fullAssistantText = "Sorry — could you say that again?";
+      }
+
+      conversation.push({
+        role: "assistant",
+        content: fullAssistantText,
+      });
+
+      if (conversation.length > 12) {
+        const systemMessage = conversation[0];
+        const recent = conversation.slice(-10);
+        conversation.length = 0;
+        conversation.push(systemMessage, ...recent);
+      }
+
+      console.log("🤖 Assistant:", fullAssistantText);
+    } catch (error) {
+      console.error("❌ Error:", error);
+
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "text",
+            token: "Sorry — I hit a problem on my side.",
+            last: true,
+          })
+        );
+      } catch {}
+    } finally {
+      isGenerating = false;
     }
   });
 
@@ -87,11 +179,12 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("error", (err) => {
-    console.error("❌ WS error:", err.message);
+    console.error("❌ WebSocket error:", err.message);
   });
 });
 
 const PORT = process.env.PORT || 10000;
+
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
