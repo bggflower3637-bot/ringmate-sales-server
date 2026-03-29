@@ -41,7 +41,9 @@ wss.on("connection", (ws) => {
   console.log("🔌 Twilio ConversationRelay connected");
 
   let isGenerating = false;
+  let currentAbortController = null;
   let stage = "intro";
+  let turnCounter = 0;
 
   const conversation = [
     {
@@ -85,7 +87,7 @@ Bad examples:
     },
   ];
 
-  // 첫 마디는 고정
+  // 첫 마디 고정
   ws.send(
     JSON.stringify({
       type: "text",
@@ -108,14 +110,26 @@ Bad examples:
       }
 
       const userText = (msg.voicePrompt || msg.transcript || "").trim();
-
       if (!userText) {
         return;
       }
 
       console.log("👤 User said:", userText);
 
-      // 첫 응답 받으면 세일즈 모드로 부드럽게 전환
+      // 🔥 사용자가 말하면 현재 생성 중인 응답 중단
+      if (currentAbortController) {
+        try {
+          currentAbortController.abort();
+          console.log("⛔ Current OpenAI stream aborted due to user interrupt");
+        } catch (abortError) {
+          console.error("❌ Abort error:", abortError.message);
+        } finally {
+          currentAbortController = null;
+          isGenerating = false;
+        }
+      }
+
+      // 첫 응답 받으면 세일즈 모드 전환
       if (stage === "intro") {
         stage = "sales";
 
@@ -155,24 +169,39 @@ Bad examples:
       }
 
       isGenerating = true;
+      turnCounter += 1;
 
       conversation.push({
         role: "user",
         content: userText,
       });
 
-      const stream = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        stream: true,
-        temperature: 0.3,
-        max_tokens: 60,
-        messages: conversation,
-      });
+      const abortController = new AbortController();
+      currentAbortController = abortController;
+
+      const stream = await openai.chat.completions.create(
+        {
+          model: "gpt-4o-mini",
+          stream: true,
+          temperature: 0.3,
+          max_tokens: 60,
+          messages: conversation,
+        },
+        {
+          signal: abortController.signal,
+        }
+      );
 
       let fullAssistantText = "";
       let pendingToken = null;
 
       for await (const chunk of stream) {
+        // 중간에 인터럽트되면 종료
+        if (abortController.signal.aborted) {
+          console.log("🛑 Stream loop stopped after abort");
+          return;
+        }
+
         const delta = chunk.choices?.[0]?.delta?.content || "";
         if (!delta) continue;
 
@@ -189,6 +218,10 @@ Bad examples:
         }
 
         pendingToken = delta;
+      }
+
+      if (abortController.signal.aborted) {
+        return;
       }
 
       if (pendingToken !== null) {
@@ -227,6 +260,12 @@ Bad examples:
 
       console.log("🤖 Assistant:", fullAssistantText);
     } catch (error) {
+      // abort는 정상 흐름처럼 취급
+      if (error?.name === "AbortError") {
+        console.log("⛔ OpenAI request aborted");
+        return;
+      }
+
       console.error("❌ Error:", error);
 
       try {
@@ -240,10 +279,16 @@ Bad examples:
       } catch {}
     } finally {
       isGenerating = false;
+      currentAbortController = null;
     }
   });
 
   ws.on("close", () => {
+    if (currentAbortController) {
+      try {
+        currentAbortController.abort();
+      } catch {}
+    }
     console.log("❌ Twilio ConversationRelay disconnected");
   });
 
