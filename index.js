@@ -1,4 +1,5 @@
 import express from "express";
+import WebSocket from "ws";
 
 const app = express();
 app.use(express.json());
@@ -12,12 +13,9 @@ app.post("/openai-realtime-webhook", async (req, res) => {
     const event = req.body;
     console.log("Incoming webhook event:", JSON.stringify(event, null, 2));
 
-    // OpenAI 쪽에는 먼저 바로 응답
     res.status(200).send("ok");
 
-    if (event?.type !== "realtime.call.incoming") {
-      return;
-    }
+    if (event?.type !== "realtime.call.incoming") return;
 
     const callId = event?.data?.call_id;
     if (!callId) {
@@ -25,7 +23,7 @@ app.post("/openai-realtime-webhook", async (req, res) => {
       return;
     }
 
-    const response = await fetch(
+    const acceptRes = await fetch(
       `https://api.openai.com/v1/realtime/calls/${callId}/accept`,
       {
         method: "POST",
@@ -38,47 +36,58 @@ app.post("/openai-realtime-webhook", async (req, res) => {
           model: "gpt-realtime",
           instructions: `
 You are Alex from Ringmate.
-
-IMPORTANT:
-- Start speaking immediately as soon as the call connects.
-- Do NOT wait for the user to speak first.
-- Keep responses short, natural, and conversational.
-- Sound like a real human, not a script or robot.
-- Use a warm, confident, casual tone.
-- Add slight natural pauses.
-- Do not give long explanations.
-- Ask only one short question at a time.
-
-GOAL:
-- Start the conversation naturally.
-- Find out whether they are handling calls manually.
-- Keep the interaction smooth and human-like.
-
-OPENING:
-Start with this exact style:
-"Hey — this is Alex from Ringmate... quick question."
-
-Then continue naturally, for example:
-"Are you the one handling calls over there?"
-or
-"Are you still handling incoming calls manually right now?"
-
-STYLE RULES:
-- Short sentences.
-- No corporate jargon.
-- No long monologues.
-- No bullet-point sounding speech.
-- Speak like a calm, experienced human caller.
-- If the user responds, acknowledge briefly before asking the next question.
-- Never sound overly salesy in the first few seconds.
-          `
+Speak naturally, warmly, and confidently.
+Keep responses short and conversational.
+Sound like a real human, not a robot.
+`
         })
       }
     );
 
-    const text = await response.text();
-    console.log("ACCEPT STATUS:", response.status);
-    console.log("ACCEPT BODY:", text);
+    const acceptText = await acceptRes.text();
+    console.log("ACCEPT STATUS:", acceptRes.status);
+    console.log("ACCEPT BODY:", acceptText);
+
+    if (!acceptRes.ok) return;
+
+    const ws = new WebSocket(
+      `wss://api.openai.com/v1/realtime?call_id=${callId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "OpenAI-Beta": "realtime=v1"
+        }
+      }
+    );
+
+    ws.on("open", () => {
+      console.log("Realtime websocket connected for call:", callId);
+
+      ws.send(JSON.stringify({
+        type: "response.create",
+        response: {
+          instructions: `
+Start speaking immediately.
+Do not wait for the user to speak first.
+
+Say exactly:
+"Hey — this is Alex from Ringmate... quick question. Are you the one handling calls over there?"
+`
+        }
+      }));
+    });
+
+    ws.on("message", (data) => {
+      console.log("Realtime event:", data.toString());
+    });
+
+    ws.on("error", (err) => {
+      console.error("Realtime websocket error:", err);
+    });
+
+    ws.on("close", () => {
+      console.log("Realtime websocket closed for call:", callId);
+    });
 
   } catch (error) {
     console.error("Webhook error:", error);
