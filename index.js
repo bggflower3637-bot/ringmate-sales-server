@@ -37,57 +37,57 @@ app.post("/voice", (req, res) => {
   `);
 });
 
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 wss.on("connection", (ws) => {
   console.log("🔌 Twilio ConversationRelay connected");
 
   let isGenerating = false;
   let currentAbortController = null;
   let stage = "intro";
-  let turnCounter = 0;
+  let activeResponseId = 0;
 
   const conversation = [
     {
       role: "system",
       content: `
 You are a human sales caller on a live phone call.
-
 You work for Ringmate.
 
-Your style:
-- sound like a real person
-- sound calm, short, warm, and conversational
-- never sound like an AI assistant
-- never sound formal
-- never over-explain
-- never use bullet points
-- usually speak in 1 short sentence, max 2 short sentences
-- ask only one question at a time
-- react first, then ask
-- use natural fillers like "yeah", "got it", "okay", "right"
-- use spoken pauses with dashes like "—"
+Style rules:
+- Sound like a real person
+- Calm, short, warm, conversational
+- Never sound like customer support
+- Never sound formal
+- Never over-explain
+- Usually 1 short sentence, max 2 short sentences
+- Ask one question at a time
+- React first, then ask
+- Use natural fillers like "yeah", "got it", "okay", "right"
+- Use spoken pauses with dashes like "—"
+- Keep the flow natural
+- Make it feel like a real live call
 
 Important:
-- this is a live phone call
-- keep the flow natural
-- make it feel casual and human
-- do not suddenly sound salesy in the first line
-- after the first small greeting exchange, gently move into the sales question
+- First line should be casual, not salesy
+- After the first small greeting exchange, move gently into sales
+- Often begin with a short reaction before the main sentence
+- Sound like you are thinking naturally, not reading a script
 
 Good examples:
 - "Yeah — got it. Quick question — are you handling calls yourself right now?"
 - "Okay — makes sense. Do you ever miss calls when things get busy?"
 - "Right — got it. About how many calls do you usually get in a day?"
-
-Bad examples:
-- long explanations
-- sounding like customer support
-- sounding robotic
-- sounding too polished or scripted
       `.trim(),
     },
   ];
 
-  // 첫 마디 고정
   ws.send(
     JSON.stringify({
       type: "text",
@@ -96,94 +96,59 @@ Bad examples:
     })
   );
 
-  ws.on("message", async (raw) => {
+  async function sendThinkingFiller(responseId) {
+    const fillers = [
+      "Yeah —",
+      "Okay —",
+      "Got it —",
+      "Right —",
+      "Mm-hmm —",
+    ];
+
+    const filler = pickRandom(fillers);
+
+    if (responseId !== activeResponseId) return false;
+
+    ws.send(
+      JSON.stringify({
+        type: "text",
+        token: filler,
+        last: false,
+      })
+    );
+
+    await wait(180);
+
+    return responseId === activeResponseId;
+  }
+
+  async function streamAssistantReply(userText) {
+    isGenerating = true;
+    activeResponseId += 1;
+    const thisResponseId = activeResponseId;
+
+    conversation.push({
+      role: "user",
+      content: userText,
+    });
+
+    const abortController = new AbortController();
+    currentAbortController = abortController;
+
+    let fullAssistantText = "";
+    let pendingToken = null;
+
     try {
-      const msg = JSON.parse(raw.toString());
-      console.log("📩 From Twilio:", msg);
-
-      if (msg.type === "setup") {
+      const fillerStillValid = await sendThinkingFiller(thisResponseId);
+      if (!fillerStillValid || abortController.signal.aborted) {
         return;
       }
-
-      if (msg.type !== "prompt") {
-        return;
-      }
-
-      const userText = (msg.voicePrompt || msg.transcript || "").trim();
-      if (!userText) {
-        return;
-      }
-
-      console.log("👤 User said:", userText);
-
-      // 🔥 사용자가 말하면 현재 생성 중인 응답 중단
-      if (currentAbortController) {
-        try {
-          currentAbortController.abort();
-          console.log("⛔ Current OpenAI stream aborted due to user interrupt");
-        } catch (abortError) {
-          console.error("❌ Abort error:", abortError.message);
-        } finally {
-          currentAbortController = null;
-          isGenerating = false;
-        }
-      }
-
-      // 첫 응답 받으면 세일즈 모드 전환
-      if (stage === "intro") {
-        stage = "sales";
-
-        conversation.push({
-          role: "user",
-          content: userText,
-        });
-
-        const secondLine =
-          "Yeah — got it. Quick question — are you handling calls yourself right now?";
-
-        ws.send(
-          JSON.stringify({
-            type: "text",
-            token: secondLine,
-            last: true,
-          })
-        );
-
-        conversation.push({
-          role: "assistant",
-          content: secondLine,
-        });
-
-        return;
-      }
-
-      if (isGenerating) {
-        ws.send(
-          JSON.stringify({
-            type: "text",
-            token: "Yeah — one second.",
-            last: true,
-          })
-        );
-        return;
-      }
-
-      isGenerating = true;
-      turnCounter += 1;
-
-      conversation.push({
-        role: "user",
-        content: userText,
-      });
-
-      const abortController = new AbortController();
-      currentAbortController = abortController;
 
       const stream = await openai.chat.completions.create(
         {
           model: "gpt-4o-mini",
           stream: true,
-          temperature: 0.3,
+          temperature: 0.35,
           max_tokens: 60,
           messages: conversation,
         },
@@ -192,13 +157,8 @@ Bad examples:
         }
       );
 
-      let fullAssistantText = "";
-      let pendingToken = null;
-
       for await (const chunk of stream) {
-        // 중간에 인터럽트되면 종료
-        if (abortController.signal.aborted) {
-          console.log("🛑 Stream loop stopped after abort");
+        if (abortController.signal.aborted || thisResponseId !== activeResponseId) {
           return;
         }
 
@@ -220,7 +180,7 @@ Bad examples:
         pendingToken = delta;
       }
 
-      if (abortController.signal.aborted) {
+      if (abortController.signal.aborted || thisResponseId !== activeResponseId) {
         return;
       }
 
@@ -246,9 +206,12 @@ Bad examples:
         fullAssistantText = fallback;
       }
 
+      // filler까지 포함해서 메모리에 남기기
+      const rememberedText = `${fullAssistantText}`.trim();
+
       conversation.push({
         role: "assistant",
-        content: fullAssistantText,
+        content: rememberedText,
       });
 
       if (conversation.length > 12) {
@@ -260,7 +223,6 @@ Bad examples:
 
       console.log("🤖 Assistant:", fullAssistantText);
     } catch (error) {
-      // abort는 정상 흐름처럼 취급
       if (error?.name === "AbortError") {
         console.log("⛔ OpenAI request aborted");
         return;
@@ -278,8 +240,75 @@ Bad examples:
         );
       } catch {}
     } finally {
-      isGenerating = false;
-      currentAbortController = null;
+      if (thisResponseId === activeResponseId) {
+        isGenerating = false;
+        currentAbortController = null;
+      }
+    }
+  }
+
+  ws.on("message", async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      console.log("📩 From Twilio:", msg);
+
+      if (msg.type === "setup") return;
+      if (msg.type !== "prompt") return;
+
+      const userText = (msg.voicePrompt || msg.transcript || "").trim();
+      if (!userText) return;
+
+      console.log("👤 User said:", userText);
+
+      if (currentAbortController) {
+        try {
+          currentAbortController.abort();
+          console.log("⛔ Aborted current response due to interrupt");
+        } catch {}
+        currentAbortController = null;
+        isGenerating = false;
+      }
+
+      activeResponseId += 1;
+
+      if (stage === "intro") {
+        stage = "sales";
+
+        conversation.push({
+          role: "user",
+          content: userText,
+        });
+
+        ws.send(
+          JSON.stringify({
+            type: "text",
+            token: "Yeah — got it. Quick question — are you handling calls yourself right now?",
+            last: true,
+          })
+        );
+
+        conversation.push({
+          role: "assistant",
+          content: "Yeah — got it. Quick question — are you handling calls yourself right now?",
+        });
+
+        return;
+      }
+
+      if (isGenerating) {
+        ws.send(
+          JSON.stringify({
+            type: "text",
+            token: "Yeah — one second.",
+            last: true,
+          })
+        );
+        return;
+      }
+
+      await streamAssistantReply(userText);
+    } catch (error) {
+      console.error("❌ WebSocket message error:", error);
     }
   });
 
