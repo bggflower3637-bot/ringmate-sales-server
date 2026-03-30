@@ -1,5 +1,6 @@
 import express from "express";
 import WebSocket from "ws";
+import fs from "fs/promises";
 
 const app = express();
 app.use(express.json());
@@ -8,6 +9,15 @@ const activeCalls = new Map();
 
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const CALL_LOG_FILE = "./call_logs.jsonl";
+
+async function appendCallLog(row) {
+  try {
+    await fs.appendFile(CALL_LOG_FILE, JSON.stringify(row) + "\n", "utf8");
+  } catch (err) {
+    console.error("Failed to write call log:", err);
+  }
+}
 
 app.get("/", (req, res) => {
   res.send("Ringmate SIP realtime server running");
@@ -31,8 +41,39 @@ app.post("/openai-realtime-webhook", async (req, res) => {
       startedAt: Date.now(),
       openerSent: false,
       sessionReady: false,
-      ws: null
+      ws: null,
+      logged: false,
+      outcome: "unknown",
+      phoneNumber:
+        event?.data?.from ??
+        event?.data?.from_number ??
+        event?.data?.caller ??
+        event?.data?.phone_number ??
+        null
     });
+
+    const writeFinalLog = async (status = "completed") => {
+      const state = activeCalls.get(callId);
+      if (!state || state.logged) return;
+
+      state.logged = true;
+
+      const endedAt = Date.now();
+      const durationSec = Math.max(
+        0,
+        Math.round((endedAt - state.startedAt) / 1000)
+      );
+
+      await appendCallLog({
+        callId,
+        phoneNumber: state.phoneNumber,
+        startedAt: new Date(state.startedAt).toISOString(),
+        endedAt: new Date(endedAt).toISOString(),
+        durationSec,
+        status,
+        outcome: state.outcome
+      });
+    };
 
     // ✅ BASELINE FIXED: accept first, then connect websocket
     const acceptRes = await fetch(
@@ -288,6 +329,22 @@ Then STOP speaking.
     if (!acceptRes.ok) {
       const errorText = await acceptRes.text().catch(() => "");
       console.error("Call accept failed:", acceptRes.status, errorText);
+
+      await appendCallLog({
+        callId,
+        phoneNumber:
+          event?.data?.from ??
+          event?.data?.from_number ??
+          event?.data?.caller ??
+          event?.data?.phone_number ??
+          null,
+        startedAt: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        durationSec: 0,
+        status: "accept_failed",
+        outcome: "unknown"
+      });
+
       activeCalls.delete(callId);
       return;
     }
@@ -614,7 +671,8 @@ GENERAL RULES
       }
     });
 
-    ws.on("close", () => {
+    ws.on("close", async () => {
+      await writeFinalLog("completed");
       activeCalls.delete(callId);
     });
 
@@ -622,13 +680,16 @@ GENERAL RULES
       console.error("WebSocket error:", err);
     });
 
-    setTimeout(() => {
+    setTimeout(async () => {
       const state = activeCalls.get(callId);
+
       if (state?.ws) {
         try {
           state.ws.close();
         } catch {}
       }
+
+      await writeFinalLog("timeout_closed");
       activeCalls.delete(callId);
     }, 10 * 60 * 1000);
 
