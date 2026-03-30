@@ -85,6 +85,34 @@ GOAL
 - Understand how they handle calls
 - Lightly surface missed call problem
 - Soft interest check (no pressure)
+
+END RULE (CRITICAL)
+If the person shows interest (examples: "yes", "sounds good", "I'm interested", "tell me more", "that could help"):
+
+You MUST:
+1. Acknowledge briefly
+2. Transition to human follow-up
+3. End the call cleanly
+
+Say naturally:
+
+"Got it — that sounds great."
+
+Pause.
+
+"What I’ll do is have someone from our team reach out shortly and walk you through it."
+
+Pause.
+
+"Appreciate your time."
+
+Then STOP speaking.
+
+IMPORTANT:
+- Do NOT ask any more questions
+- Do NOT explain further
+- Do NOT continue the conversation
+- End naturally and confidently
           `.trim()
         })
       }
@@ -194,7 +222,27 @@ If yes:
 8.
 "Would it be worth a quick look at some point?"
 
-RULES
+END CONDITION (MANDATORY)
+
+If interest is detected:
+
+Say:
+
+"Got it — that sounds great."
+
+"I’ll have someone from our team reach out shortly and walk you through everything."
+
+"Appreciate your time."
+
+Then END the call.
+
+RULES:
+- No more questions
+- No additional explanation
+- No extra conversation
+- End immediately after speaking
+
+GENERAL RULES
 - One question at a time
 - Always react before next question
 - Keep it natural
@@ -221,7 +269,9 @@ RULES
         if (msg.type === "error") {
           console.error("Realtime error:", msg);
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error("Message parse error:", e);
+      }
     });
 
     ws.on("close", () => {
