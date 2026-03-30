@@ -23,23 +23,16 @@ app.post("/openai-realtime-webhook", async (req, res) => {
     if (event?.type !== "realtime.call.incoming") return;
 
     const callId = event?.data?.call_id;
-    if (!callId) {
-      console.log("No call_id found");
-      return;
-    }
+    if (!callId) return;
 
-    if (activeCalls.has(callId)) {
-      console.log("Call already being handled:", callId);
-      return;
-    }
+    if (activeCalls.has(callId)) return;
 
     activeCalls.set(callId, {
       startedAt: Date.now(),
-      accepted: false,
-      ws: null,
       openerSent: false
     });
 
+    // ✅ CALL ACCEPT (핵심 유지)
     const acceptRes = await fetch(
       `https://api.openai.com/v1/realtime/calls/${callId}/accept`,
       {
@@ -52,81 +45,69 @@ app.post("/openai-realtime-webhook", async (req, res) => {
           type: "realtime",
           model: "gpt-realtime",
           audio: {
-            output: {
-              voice: "cedar"
-            }
+            output: { voice: "cedar" }
           },
           instructions: `
 You are Alex from Ringmate.
 
 IDENTITY
-- You are a real-sounding business caller.
-- You are calm, respectful, mature, and easy to talk to.
+You are a calm, mature business caller.
 
-VOICE
-- Speak slowly.
-- Speak a little more slowly than normal business speech.
-- Use a calm, grounded, slightly warm tone.
-- Never sound rushed.
-- Never sound overly cheerful.
-- Never sound like a telemarketer.
-- Never sound like you are reading a script.
+MISSION (FIXED)
+You are calling about how they handle incoming calls.
+You must find out:
+- who handles calls
+- how calls are handled
+- whether missed calls are a problem
 
-PACING
-- Keep sentences short.
-- Say one idea at a time.
-- Pause naturally between sentences.
-- Let each sentence land before moving on.
-- Do not stack ideas together.
-- Do not speak in long paragraphs.
+Never lose this context.
 
-CONVERSATION STYLE
-- Start gently.
-- Greet first.
-- Sound polite and human.
-- Ask permission before getting into the reason for the call.
-- Do not jump into sales language.
-- Do not pressure.
-- Ask only one short question at a time.
-- After they answer, acknowledge briefly and continue naturally.
+SPEED (MANDATORY)
+- Speak slowly
+- Never rush
+- Pause after each sentence
+- Use short sentences
+- One idea per sentence
 
-OPENING STYLE
-- Start with a polite hello.
-- Briefly introduce yourself.
-- Ask if now is a bad time.
-- Ask if you can ask a quick question.
-- Keep the opening soft and conversational.
+STYLE
+- Calm
+- Grounded
+- Natural
+- Human
+- Not salesy
+- Not pushy
 
-GOAL
-- Have a natural conversation.
-- Build comfort first.
-- Then find out whether they are handling calls manually.
-- If there is interest, offer a human follow-up.
-- If they are busy or not interested, end politely and briefly.
+CONVERSATION CONTROL
+- Do not drift into random topics
+- Do not become a general assistant
+- Move into the purpose within 2–3 turns
+- Stay focused on calls
 
-IMPORTANT
-- Begin speaking first when the call connects.
-- But do not come in too strong.
-- The first few seconds should feel human, calm, and easy.
+FLOW (STRICT ORDER)
+
+1. Greeting
+2. Permission
+3. Who handles calls
+4. How calls are handled
+5. Missed calls / pain
+6. Light connection to Ringmate
+7. Interest check
+8. Exit or follow-up
+
+RECOVERY
+If conversation drifts → bring back to:
+"how you handle incoming calls"
           `
         })
       }
     );
-
-    const acceptText = await acceptRes.text();
-    console.log("ACCEPT STATUS:", acceptRes.status);
-    console.log("ACCEPT BODY:", acceptText);
 
     if (!acceptRes.ok) {
       activeCalls.delete(callId);
       return;
     }
 
-    activeCalls.set(callId, {
-      ...activeCalls.get(callId),
-      accepted: true
-    });
-
+    // ✅ WebSocket 연결
     const ws = new WebSocket(
       `wss://api.openai.com/v1/realtime?call_id=${callId}`,
       {
@@ -137,16 +118,12 @@ IMPORTANT
       }
     );
 
-    activeCalls.set(callId, {
-      ...activeCalls.get(callId),
-      ws
-    });
-
     let sessionReady = false;
 
     ws.on("open", () => {
-      console.log("Realtime websocket connected for call:", callId);
+      console.log("Realtime connected:", callId);
 
+      // ✅ 대화 흐름 고정
       ws.send(
         JSON.stringify({
           type: "session.update",
@@ -156,17 +133,45 @@ IMPORTANT
             instructions: `
 You are Alex from Ringmate.
 
-Speak slowly and naturally.
-Sound calm, mature, and human.
-Never rush.
-Never sound scripted.
-Keep each sentence short.
-Pause naturally between sentences.
-Start soft.
-Ask permission before getting into the call.
-Do not sound salesy.
-Do not push.
-One question at a time.
+MISSION
+Stay focused on how they handle incoming calls.
+
+SPEED (HARD RULE)
+- Speak slowly
+- Never rush
+- Pause after each sentence
+- Keep sentences short
+
+CONTEXT LOCK
+- Never leave the call-handling topic
+- No random conversation
+- No broad business talk
+
+CONVERSATION FLOW
+
+After greeting:
+
+Step 1:
+"Are you the one handling calls there?"
+
+Step 2:
+"How are you guys handling those right now?"
+
+Step 3:
+"Do you ever miss calls… or get them after hours?"
+
+Step 4:
+If problem exists:
+"Yeah… that’s actually what we help with."
+
+Step 5:
+"Is that something you'd be open to taking a look at… at some point?"
+
+RULES
+- One question at a time
+- Short responses
+- Brief acknowledgment only
+- Keep moving forward
             `
           }
         })
@@ -178,7 +183,6 @@ One question at a time.
       if (!state || state.openerSent || !sessionReady) return;
 
       state.openerSent = true;
-      activeCalls.set(callId, state);
 
       ws.send(
         JSON.stringify({
@@ -188,26 +192,25 @@ One question at a time.
 Start speaking now.
 
 Speak slowly.
-Sound calm, natural, and polite.
-Do not rush.
-Pause naturally between each sentence.
+Pause after each sentence.
 
-Say this style of opener:
+Say:
 
-"Hi, this is Alex... with Ringmate."
+"Hi, this is Alex with Ringmate."
 
-Small natural pause.
+Pause.
 
-"How are you today?"
+"Hope you're doing well."
 
-Small natural pause.
+Pause.
 
-"I was hoping to ask you something real quick... if this is an okay time."
+"I'll be quick… I just had a quick question about how you're handling your incoming calls."
 
-Then stop and wait for their answer.
+Pause.
 
-If they say yes, continue gently.
-If they sound busy, apologize briefly and keep it short.
+"Is now a bad time?"
+
+Then wait.
             `
           }
         })
@@ -215,51 +218,42 @@ If they sound busy, apologize briefly and keep it short.
     };
 
     ws.on("message", (data) => {
-      const text = data.toString();
-      console.log("Realtime event:", text);
-
       try {
-        const msg = JSON.parse(text);
+        const msg = JSON.parse(data.toString());
 
-        if (msg.type === "session.updated" || msg.type === "session.created") {
+        if (
+          msg.type === "session.created" ||
+          msg.type === "session.updated"
+        ) {
           sessionReady = true;
           sendOpening();
         }
 
         if (msg.type === "error") {
-          console.error("Realtime error event:", JSON.stringify(msg, null, 2));
+          console.error("Realtime error:", msg);
         }
-      } catch (err) {
-        console.error("Failed to parse realtime message:", err);
-      }
-    });
-
-    ws.on("error", (err) => {
-      console.error("Realtime websocket error:", err);
+      } catch (e) {}
     });
 
     ws.on("close", () => {
-      console.log("Realtime websocket closed for call:", callId);
       activeCalls.delete(callId);
     });
 
     setTimeout(() => {
       if (activeCalls.has(callId)) {
-        console.log("Cleaning up stale call:", callId);
         try {
           activeCalls.get(callId)?.ws?.close();
         } catch {}
         activeCalls.delete(callId);
       }
     }, 10 * 60 * 1000);
-  } catch (error) {
-    console.error("Webhook error:", error);
-    if (!res.headersSent) {
-      res.status(500).send("error");
-    }
+
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).send("error");
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log("Server running on port", PORT);
 });
