@@ -10,6 +10,7 @@ const activeCalls = new Map();
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const CALL_LOG_FILE = "./call_logs.jsonl";
+const CLASSIFIER_MODEL = process.env.CLASSIFIER_MODEL || "gpt-5.4-mini";
 
 async function appendCallLog(row) {
   try {
@@ -17,6 +18,169 @@ async function appendCallLog(row) {
   } catch (err) {
     console.error("Failed to write call log:", err);
   }
+}
+
+function extractOutputText(responseJson) {
+  if (typeof responseJson?.output_text === "string" && responseJson.output_text) {
+    return responseJson.output_text;
+  }
+
+  const output = Array.isArray(responseJson?.output) ? responseJson.output : [];
+  const texts = [];
+
+  for (const item of output) {
+    if (!Array.isArray(item?.content)) continue;
+    for (const part of item.content) {
+      if (part?.type === "output_text" && typeof part?.text === "string") {
+        texts.push(part.text);
+      }
+    }
+  }
+
+  return texts.join("\n").trim();
+}
+
+function normalizeTranscriptEntries(transcript) {
+  return (Array.isArray(transcript) ? transcript : [])
+    .filter((item) => item && typeof item.text === "string" && item.text.trim())
+    .map((item) => ({
+      role: item.role === "user" ? "user" : "assistant",
+      text: item.text.trim(),
+      at: item.at || new Date().toISOString()
+    }));
+}
+
+async function classifyTranscript(transcript) {
+  const cleanedTranscript = normalizeTranscriptEntries(transcript);
+
+  if (cleanedTranscript.length === 0) {
+    return {
+      outcome: "hangup_early",
+      leadScore: "cold",
+      followUpNeeded: false,
+      decisionMakerReached: false,
+      receptionistEncountered: false,
+      summary: "No usable transcript was captured.",
+      nextAction: "none"
+    };
+  }
+
+  const transcriptText = cleanedTranscript
+    .map((line) => `${line.role.toUpperCase()}: ${line.text}`)
+    .join("\n");
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      outcome: {
+        type: "string",
+        enum: [
+          "interested",
+          "unsure",
+          "not_interested",
+          "receptionist_only",
+          "voicemail",
+          "hangup_early"
+        ]
+      },
+      leadScore: {
+        type: "string",
+        enum: ["hot", "warm", "cold"]
+      },
+      followUpNeeded: {
+        type: "boolean"
+      },
+      decisionMakerReached: {
+        type: "boolean"
+      },
+      receptionistEncountered: {
+        type: "boolean"
+      },
+      summary: {
+        type: "string"
+      },
+      nextAction: {
+        type: "string",
+        enum: ["immediate_human_followup", "later_retry", "none"]
+      }
+    },
+    required: [
+      "outcome",
+      "leadScore",
+      "followUpNeeded",
+      "decisionMakerReached",
+      "receptionistEncountered",
+      "summary",
+      "nextAction"
+    ]
+  };
+
+  const classifyRes = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: CLASSIFIER_MODEL,
+      input: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text:
+                "You classify outbound sales calls for Ringmate. " +
+                "Return only the schema. " +
+                "Classify based strictly on the transcript. " +
+                "interested = clear or mildly positive interest. " +
+                "unsure = hesitant or curious but not committed. " +
+                "not_interested = clear rejection. " +
+                "receptionist_only = only gatekeeper/front desk interaction, no real discovery with call handler. " +
+                "voicemail = voicemail or greeting with no live conversation. " +
+                "hangup_early = call ended too quickly to classify otherwise. " +
+                "leadScore hot = strong interest or clear missed-call pain plus follow-up openness. " +
+                "warm = maybe/unclear but some relevance. " +
+                "cold = no fit, rejection, or too little signal. " +
+                "followUpNeeded should be true only when human follow-up is worthwhile."
+            }
+          ]
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: transcriptText
+            }
+          ]
+        }
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "call_classification",
+          strict: true,
+          schema
+        }
+      }
+    })
+  });
+
+  if (!classifyRes.ok) {
+    const errorText = await classifyRes.text().catch(() => "");
+    throw new Error(`Classification failed: ${classifyRes.status} ${errorText}`);
+  }
+
+  const responseJson = await classifyRes.json();
+  const outputText = extractOutputText(responseJson);
+
+  if (!outputText) {
+    throw new Error("Classification returned empty output.");
+  }
+
+  return JSON.parse(outputText);
 }
 
 app.get("/", (req, res) => {
@@ -43,7 +207,14 @@ app.post("/openai-realtime-webhook", async (req, res) => {
       sessionReady: false,
       ws: null,
       logged: false,
+      transcript: [],
       outcome: "unknown",
+      leadScore: "cold",
+      followUpNeeded: false,
+      decisionMakerReached: false,
+      receptionistEncountered: false,
+      summary: "",
+      nextAction: "none",
       phoneNumber:
         event?.data?.from ??
         event?.data?.from_number ??
@@ -64,6 +235,30 @@ app.post("/openai-realtime-webhook", async (req, res) => {
         Math.round((endedAt - state.startedAt) / 1000)
       );
 
+      try {
+        const classification = await classifyTranscript(state.transcript);
+        state.outcome = classification.outcome;
+        state.leadScore = classification.leadScore;
+        state.followUpNeeded = classification.followUpNeeded;
+        state.decisionMakerReached = classification.decisionMakerReached;
+        state.receptionistEncountered = classification.receptionistEncountered;
+        state.summary = classification.summary;
+        state.nextAction = classification.nextAction;
+      } catch (err) {
+        console.error("Transcript classification error:", err);
+        state.summary = state.summary || "Automatic classification failed.";
+        state.nextAction = state.nextAction || "none";
+
+        if (state.transcript.length === 0) {
+          state.outcome = "hangup_early";
+          state.leadScore = "cold";
+          state.followUpNeeded = false;
+          state.decisionMakerReached = false;
+          state.receptionistEncountered = false;
+          state.nextAction = "none";
+        }
+      }
+
       await appendCallLog({
         callId,
         phoneNumber: state.phoneNumber,
@@ -71,7 +266,14 @@ app.post("/openai-realtime-webhook", async (req, res) => {
         endedAt: new Date(endedAt).toISOString(),
         durationSec,
         status,
-        outcome: state.outcome
+        outcome: state.outcome,
+        leadScore: state.leadScore,
+        followUpNeeded: state.followUpNeeded,
+        decisionMakerReached: state.decisionMakerReached,
+        receptionistEncountered: state.receptionistEncountered,
+        summary: state.summary,
+        nextAction: state.nextAction,
+        transcript: normalizeTranscriptEntries(state.transcript)
       });
     };
 
@@ -342,7 +544,14 @@ Then STOP speaking.
         endedAt: new Date().toISOString(),
         durationSec: 0,
         status: "accept_failed",
-        outcome: "unknown"
+        outcome: "unknown",
+        leadScore: "cold",
+        followUpNeeded: false,
+        decisionMakerReached: false,
+        receptionistEncountered: false,
+        summary: "Call accept failed before session started.",
+        nextAction: "none",
+        transcript: []
       });
 
       activeCalls.delete(callId);
@@ -427,6 +636,10 @@ Then wait.
           session: {
             type: "realtime",
             model: "gpt-realtime",
+            input_audio_transcription: {
+              model: "gpt-4o-mini-transcribe",
+              language: "en"
+            },
             instructions: `
 You are Alex from Ringmate.
 
@@ -653,14 +866,40 @@ GENERAL RULES
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
+        const state = activeCalls.get(callId);
+        if (!state) return;
 
         if (
           msg.type === "session.created" ||
           msg.type === "session.updated"
         ) {
-          const state = activeCalls.get(callId);
-          if (state) state.sessionReady = true;
+          state.sessionReady = true;
           sendOpening();
+          return;
+        }
+
+        if (msg.type === "conversation.item.input_audio_transcription.completed") {
+          const text = typeof msg.transcript === "string" ? msg.transcript.trim() : "";
+          if (text) {
+            state.transcript.push({
+              role: "user",
+              text,
+              at: new Date().toISOString()
+            });
+          }
+          return;
+        }
+
+        if (msg.type === "response.output_text.done") {
+          const text = typeof msg.text === "string" ? msg.text.trim() : "";
+          if (text) {
+            state.transcript.push({
+              role: "assistant",
+              text,
+              at: new Date().toISOString()
+            });
+          }
+          return;
         }
 
         if (msg.type === "error") {
