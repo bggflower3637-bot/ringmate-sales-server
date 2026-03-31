@@ -1,6 +1,11 @@
 import express from "express";
 import WebSocket from "ws";
 import fs from "fs/promises";
+import { GoogleSpreadsheet } from 'google-spreadsheet';
+
+const creds = JSON.parse(process.env.GOOGLE_CREDS);
+const SHEET_ID =1LxfY4BSFwQZTllTEwCsJJSxJ_1qRCLWXq45-370kLKI;
+const doc = new GoogleSpreadsheet(SHEET_ID);
 
 const app = express();
 app.use(express.json());
