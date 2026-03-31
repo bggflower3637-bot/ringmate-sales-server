@@ -1,11 +1,7 @@
 import express from "express";
 import WebSocket from "ws";
 import fs from "fs/promises";
-import { GoogleSpreadsheet } from 'google-spreadsheet';
-
-const creds = JSON.parse(process.env.GOOGLE_CREDS);
-const SHEET_ID =1LxfY4BSFwQZTllTEwCsJJSxJ_1qRCLWXq45-370kLKI;
-const doc = new GoogleSpreadsheet(SHEET_ID);
+import { google } from "googleapis";
 
 const app = express();
 app.use(express.json());
@@ -17,11 +13,128 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const CALL_LOG_FILE = "./call_logs.jsonl";
 const CLASSIFIER_MODEL = process.env.CLASSIFIER_MODEL || "gpt-5.4-mini";
 
+const GOOGLE_CREDS = process.env.GOOGLE_CREDS;
+const SHEET_ID = "1LxfY4BSFwQZTllTEwCsJJSxJ_1qRCLWXq45-370kLKI";
+const SHEET_NAME = process.env.SHEET_NAME || "Sheet1";
+
+function getGoogleCredentials() {
+  if (!GOOGLE_CREDS) {
+    throw new Error("Missing GOOGLE_CREDS environment variable.");
+  }
+
+  const creds = JSON.parse(GOOGLE_CREDS);
+
+  if (typeof creds.private_key === "string") {
+    creds.private_key = creds.private_key.replace(/\\n/g, "\n");
+  }
+
+  return creds;
+}
+
 async function appendCallLog(row) {
   try {
     await fs.appendFile(CALL_LOG_FILE, JSON.stringify(row) + "\n", "utf8");
   } catch (err) {
     console.error("Failed to write call log:", err);
+  }
+}
+
+function mapClassificationToSheet(row) {
+  let sheetStatus = "called";
+  let sheetOutcome = "maybe";
+  let leadScore = 2;
+
+  switch (row.outcome) {
+    case "interested":
+      sheetStatus = "interested";
+      sheetOutcome = "positive";
+      leadScore = 3;
+      break;
+
+    case "not_interested":
+      sheetStatus = "closed";
+      sheetOutcome = "not_interested";
+      leadScore = 1;
+      break;
+
+    case "unsure":
+      sheetStatus = "follow-up";
+      sheetOutcome = "maybe";
+      leadScore = 2;
+      break;
+
+    case "voicemail":
+    case "hangup_early":
+      sheetStatus = "called";
+      sheetOutcome = "no_answer";
+      leadScore = 0;
+      break;
+
+    case "receptionist_only":
+      sheetStatus = "follow-up";
+      sheetOutcome = "maybe";
+      leadScore = 2;
+      break;
+
+    default:
+      sheetStatus = "called";
+      sheetOutcome = "maybe";
+      leadScore = 2;
+      break;
+  }
+
+  return {
+    sheetStatus,
+    sheetOutcome,
+    leadScore
+  };
+}
+
+async function appendCallLogToSheet(row) {
+  try {
+    const creds = getGoogleCredentials();
+
+    const auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+    });
+
+    const sheets = google.sheets({ version: "v4", auth });
+
+    const mapped = mapClassificationToSheet(row);
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_NAME}!A:Z`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: {
+        values: [[
+          row.phoneNumber || "",                          // A
+          "",                                            // B contact_name
+          "",                                            // C
+          "",                                            // D
+          "",                                            // E
+          mapped.sheetStatus,                            // F status
+          new Date().toISOString(),                      // G last_called_at
+          1,                                             // H call_attempts
+          mapped.sheetOutcome,                           // I outcome
+          mapped.leadScore,                              // J lead_score
+          row.followUpNeeded ? "yes" : "",               // K follow_up
+          row.summary || "",                             // L summary
+          row.nextAction || "",                          // M next_action
+          row.callId || "",                              // N call_id
+          row.outcome || "",                             // O raw_outcome
+          row.leadScore || "",                           // P raw_lead_score
+          row.decisionMakerReached ? "yes" : "no",       // Q
+          row.receptionistEncountered ? "yes" : "no",    // R
+          row.startedAt || "",                           // S
+          row.endedAt || "",                             // T
+          row.durationSec ?? ""                          // U
+        ]]
+      }
+    });
+  } catch (err) {
+    console.error("Failed to append call log to sheet:", err);
   }
 }
 
@@ -264,7 +377,7 @@ app.post("/openai-realtime-webhook", async (req, res) => {
         }
       }
 
-      await appendCallLog({
+      const finalRow = {
         callId,
         phoneNumber: state.phoneNumber,
         startedAt: new Date(state.startedAt).toISOString(),
@@ -279,7 +392,10 @@ app.post("/openai-realtime-webhook", async (req, res) => {
         summary: state.summary,
         nextAction: state.nextAction,
         transcript: normalizeTranscriptEntries(state.transcript)
-      });
+      };
+
+      await appendCallLog(finalRow);
+      await appendCallLogToSheet(finalRow);
     };
 
     // ✅ BASELINE FIXED: accept first, then connect websocket
@@ -537,7 +653,7 @@ Then STOP speaking.
       const errorText = await acceptRes.text().catch(() => "");
       console.error("Call accept failed:", acceptRes.status, errorText);
 
-      await appendCallLog({
+      const failedRow = {
         callId,
         phoneNumber:
           event?.data?.from ??
@@ -557,7 +673,10 @@ Then STOP speaking.
         summary: "Call accept failed before session started.",
         nextAction: "none",
         transcript: []
-      });
+      };
+
+      await appendCallLog(failedRow);
+      await appendCallLogToSheet(failedRow);
 
       activeCalls.delete(callId);
       return;
