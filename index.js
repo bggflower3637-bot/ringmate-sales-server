@@ -92,6 +92,8 @@ function mapClassificationToSheet(row) {
 
 async function appendCallLogToSheet(row) {
   try {
+    console.log("📄 appendCallLogToSheet start");
+
     const creds = getGoogleCredentials();
 
     const auth = new google.auth.GoogleAuth({
@@ -133,6 +135,8 @@ async function appendCallLogToSheet(row) {
         ]]
       }
     });
+
+    console.log("✅ appendCallLogToSheet success");
   } catch (err) {
     console.error("Failed to append call log to sheet:", err);
   }
@@ -342,6 +346,8 @@ app.post("/openai-realtime-webhook", async (req, res) => {
     });
 
     const writeFinalLog = async (status = "completed") => {
+      console.log("🔥 writeFinalLog CALLED:", callId, status);
+
       const state = activeCalls.get(callId);
       if (!state || state.logged) return;
 
@@ -355,6 +361,8 @@ app.post("/openai-realtime-webhook", async (req, res) => {
 
       try {
         const classification = await classifyTranscript(state.transcript);
+        console.log("🔥 classification result:", classification);
+
         state.outcome = classification.outcome;
         state.leadScore = classification.leadScore;
         state.followUpNeeded = classification.followUpNeeded;
@@ -394,11 +402,15 @@ app.post("/openai-realtime-webhook", async (req, res) => {
         transcript: normalizeTranscriptEntries(state.transcript)
       };
 
+      console.log("🔥 finalRow ready:", finalRow);
+
       await appendCallLog(finalRow);
+      console.log("🔥 appendCallLog done");
+
       await appendCallLogToSheet(finalRow);
+      console.log("🔥 sheet append done");
     };
 
-    // ✅ BASELINE FIXED: accept first, then connect websocket
     const acceptRes = await fetch(
       `https://api.openai.com/v1/realtime/calls/${callId}/accept`,
       {
@@ -682,7 +694,6 @@ Then STOP speaking.
       return;
     }
 
-    // ✅ BASELINE FIXED: websocket with same call_id
     const ws = new WebSocket(
       `wss://api.openai.com/v1/realtime?call_id=${callId}`,
       {
@@ -1010,6 +1021,8 @@ GENERAL RULES
               text,
               at: new Date().toISOString()
             });
+
+            console.log("🟢 user:", text);
           }
           return;
         }
@@ -1022,6 +1035,23 @@ GENERAL RULES
               text,
               at: new Date().toISOString()
             });
+
+            console.log("🟣 assistant:", text);
+
+            const lower = text.toLowerCase();
+
+            const looksFinished =
+              lower.includes("appreciate your time") ||
+              lower.includes("no worries at all") ||
+              lower.includes("totally understand") ||
+              lower.includes("perfect.");
+
+            if (looksFinished) {
+              console.log("✅ detected likely call end phrase, saving now...");
+              writeFinalLog("assistant_completed").catch((err) => {
+                console.error("Forced save after assistant close phrase failed:", err);
+              });
+            }
           }
           return;
         }
@@ -1034,14 +1064,30 @@ GENERAL RULES
       }
     });
 
-    ws.on("close", async () => {
-      await writeFinalLog("completed");
+    ws.on("close", () => {
+      console.log("🔌 websocket closed:", callId);
+
+      writeFinalLog("completed").catch((err) => {
+        console.error("writeFinalLog on close failed:", err);
+      });
+
       activeCalls.delete(callId);
     });
 
     ws.on("error", (err) => {
       console.error("WebSocket error:", err);
     });
+
+    setTimeout(() => {
+      const state = activeCalls.get(callId);
+      if (!state || state.logged) return;
+
+      console.log("⏰ 20s fallback save triggered:", callId);
+
+      writeFinalLog("fallback_20s").catch((err) => {
+        console.error("20s fallback save failed:", err);
+      });
+    }, 20 * 1000);
 
     setTimeout(async () => {
       const state = activeCalls.get(callId);
