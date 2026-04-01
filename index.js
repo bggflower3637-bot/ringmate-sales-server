@@ -15,10 +15,6 @@ const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY;
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const GOOGLE_SHEET_NAME = process.env.GOOGLE_SHEET_NAME || "Sheet1";
 
-function normalizePrivateKey(key) {
-  return key ? key.replace(/\\n/g, "\n") : "";
-}
-
 function getSheetsClient() {
   if (!GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY || !GOOGLE_SHEET_ID) {
     return null;
@@ -26,14 +22,14 @@ function getSheetsClient() {
 
   const auth = new google.auth.JWT({
     email: GOOGLE_CLIENT_EMAIL,
-    key: normalizePrivateKey(GOOGLE_PRIVATE_KEY),
+    key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
     scopes: ["https://www.googleapis.com/auth/spreadsheets"]
   });
 
   return google.sheets({ version: "v4", auth });
 }
 
-async function appendCallLogToSheet(row) {
+async function appendRowToSheet(values) {
   const sheets = getSheetsClient();
   if (!sheets) {
     console.warn("Google Sheets env vars missing. Skipping sheet save.");
@@ -45,56 +41,53 @@ async function appendCallLogToSheet(row) {
     range: `${GOOGLE_SHEET_NAME}!A:F`,
     valueInputOption: "USER_ENTERED",
     requestBody: {
-      values: [row]
+      values: [values]
     }
   });
 }
 
-function safeJoinLines(lines) {
-  return lines
-    .map((x) => (typeof x === "string" ? x.trim() : ""))
-    .filter(Boolean)
-    .join("\n");
+function cleanText(text) {
+  return typeof text === "string" ? text.trim() : "";
 }
 
-function queueFinalizeCall(callId) {
+function uniquePush(arr, text) {
+  const t = cleanText(text);
+  if (!t) return;
+  if (arr[arr.length - 1] === t) return;
+  arr.push(t);
+}
+
+async function finalizeAndSaveCall(callId) {
   const state = activeCalls.get(callId);
   if (!state || state.finalized) return;
 
   state.finalized = true;
 
-  setTimeout(async () => {
-    try {
-      const finalState = activeCalls.get(callId);
-      if (!finalState) return;
+  try {
+    const userTranscript = state.userLines.join("\n");
+    const assistantTranscript = state.assistantLines.join("\n");
 
-      const userTranscript = safeJoinLines(finalState.userTranscriptLines);
-      const assistantTranscript = safeJoinLines(finalState.assistantTranscriptLines);
-      const fullTranscript = safeJoinLines([
-        ...(finalState.userTranscriptLines || []).map((t) => `USER: ${t}`),
-        ...(finalState.assistantTranscriptLines || []).map((t) => `ALEX: ${t}`)
-      ]);
+    const fullTranscriptLines = [
+      ...state.userLines.map((t) => `USER: ${t}`),
+      ...state.assistantLines.map((t) => `ALEX: ${t}`)
+    ];
+    const fullTranscript = fullTranscriptLines.join("\n");
 
-      const startedAtIso = finalState.startedAt
-        ? new Date(finalState.startedAt).toISOString()
-        : new Date().toISOString();
+    await appendRowToSheet([
+      new Date(state.startedAt).toISOString(),
+      callId,
+      userTranscript,
+      assistantTranscript,
+      fullTranscript,
+      "logged"
+    ]);
 
-      await appendCallLogToSheet([
-        startedAtIso,
-        callId,
-        userTranscript,
-        assistantTranscript,
-        fullTranscript,
-        "logged"
-      ]);
-
-      console.log("Saved call log to Google Sheets:", callId);
-    } catch (err) {
-      console.error("Failed to save call log:", callId, err);
-    } finally {
-      activeCalls.delete(callId);
-    }
-  }, 0);
+    console.log("Saved call log to Google Sheets:", callId);
+  } catch (err) {
+    console.error("Failed to save call log:", callId, err);
+  } finally {
+    activeCalls.delete(callId);
+  }
 }
 
 app.get("/", (req, res) => {
@@ -121,9 +114,8 @@ app.post("/openai-realtime-webhook", async (req, res) => {
       sessionReady: false,
       ws: null,
       finalized: false,
-      userTranscriptLines: [],
-      assistantTranscriptLines: [],
-      assistantDeltaBuffer: ""
+      userLines: [],
+      assistantLines: []
     });
 
     // ✅ BASELINE FIXED: accept first, then connect websocket
@@ -597,41 +589,48 @@ GENERAL RULES
       try {
         const msg = JSON.parse(data.toString());
         const state = activeCalls.get(callId);
-
         if (!state) return;
 
-        if (
-          msg.type === "session.created" ||
-          msg.type === "session.updated"
-        ) {
+        if (msg.type === "session.created" || msg.type === "session.updated") {
           state.sessionReady = true;
           sendOpening();
+          return;
         }
 
-        // --- transcript capture only (read-only, no call flow impact) ---
-
-        // Assistant text streaming
-        if (msg.type === "response.output_text.delta" && typeof msg.delta === "string") {
-          state.assistantDeltaBuffer += msg.delta;
-        }
-
-        // Assistant text finalized
-        if (
-          (msg.type === "response.output_text.done" ||
-            msg.type === "response.done") &&
-          state.assistantDeltaBuffer.trim()
-        ) {
-          state.assistantTranscriptLines.push(state.assistantDeltaBuffer.trim());
-          state.assistantDeltaBuffer = "";
-        }
-
-        // Caller speech transcription
+        // ✅ USER transcript only when completed
         if (
           msg.type === "conversation.item.input_audio_transcription.completed" &&
-          typeof msg.transcript === "string" &&
-          msg.transcript.trim()
+          typeof msg.transcript === "string"
         ) {
-          state.userTranscriptLines.push(msg.transcript.trim());
+          uniquePush(state.userLines, msg.transcript);
+          return;
+        }
+
+        // ✅ ASSISTANT transcript only when completed
+        if (
+          msg.type === "response.output_text.done" &&
+          typeof msg.text === "string"
+        ) {
+          uniquePush(state.assistantLines, msg.text);
+          return;
+        }
+
+        // fallback for some response shapes
+        if (msg.type === "response.done") {
+          const outputs = msg.response?.output;
+          if (Array.isArray(outputs)) {
+            for (const output of outputs) {
+              const contents = output?.content;
+              if (!Array.isArray(contents)) continue;
+
+              for (const c of contents) {
+                if (c?.type === "output_text" && typeof c.text === "string") {
+                  uniquePush(state.assistantLines, c.text);
+                }
+              }
+            }
+          }
+          return;
         }
 
         if (msg.type === "error") {
@@ -642,8 +641,8 @@ GENERAL RULES
       }
     });
 
-    ws.on("close", () => {
-      queueFinalizeCall(callId);
+    ws.on("close", async () => {
+      await finalizeAndSaveCall(callId);
     });
 
     ws.on("error", (err) => {
